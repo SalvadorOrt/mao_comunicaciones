@@ -1,0 +1,28 @@
+# Entorno
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+
+# Base local
+db.sqlite3
+*.sqlite3
+
+# Django
+staticfiles/
+media/
+
+# IDE
+.vscode/
+.idea/
+
+# Sistema
+.DS_Store
+Thumbs.db
