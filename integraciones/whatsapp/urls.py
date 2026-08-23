@@ -1,3 +1,5 @@
+# integraciones/whatsapp/urls.py
+
 from django.urls import path
 
 from integraciones.whatsapp.views import (

@@ -1,3 +1,5 @@
+# integraciones/whatsapp/tests.py
+
 import copy
 import hashlib
 import hmac
@@ -33,13 +35,14 @@ from integraciones.whatsapp.parser import (
 )
 
 from integraciones.whatsapp.services import (
+    WhatsAppEnvioError,
     enviar_mensaje_saliente,
 )
 
 
-# =========================================================
+# ==========================================================
 # CONFIGURACIÓN DE PRUEBAS
-# =========================================================
+# ==========================================================
 
 
 @override_settings(
@@ -52,9 +55,9 @@ class IntegracionWhatsAppTests(TestCase):
 
     def setUp(self):
 
-        # =====================================================
-        # SUCURSAL
-        # =====================================================
+        # ==================================================
+        # SUCURSAL ERP SINCRONIZADA
+        # ==================================================
 
         self.sucursal = Sucursal.objects.create(
             erp_sucursal_id=999,
@@ -63,31 +66,46 @@ class IntegracionWhatsAppTests(TestCase):
             activa=True,
         )
 
-        # =====================================================
-        # CANAL WHATSAPP
-        # =====================================================
+        # ==================================================
+        # CANAL CORPORATIVO WHATSAPP
+        # ==================================================
+        #
+        # El canal corporativo no necesita estar atado
+        # directamente a una sucursal.
+        # ==================================================
 
         self.canal = NumeroCanal.objects.create(
             nombre="WhatsApp Test",
+            proveedor=(
+                NumeroCanal
+                .Proveedor
+                .WHATSAPP
+            ),
+            tipo=(
+                NumeroCanal
+                .TipoCanal
+                .CORPORATIVO
+            ),
             numero_telefonico="+593981577789",
             identificador_externo="999999999",
-            sucursal=self.sucursal,
-            tipo="CORPORATIVO",
+            sucursal=None,
+            es_principal=True,
             activo=True,
         )
 
-        # =====================================================
+        # ==================================================
         # CONTACTO
-        # =====================================================
+        # ==================================================
 
         self.contacto = Contacto.objects.create(
+            nombre="Cliente Prueba",
             nombre_perfil="Cliente Prueba",
             numero_telefonico="+593990000001",
         )
 
-        # =====================================================
-        # IDENTIDAD META
-        # =====================================================
+        # ==================================================
+        # IDENTIDAD WHATSAPP / META
+        # ==================================================
 
         self.identidad = (
             IdentidadContactoExterna.objects.create(
@@ -97,15 +115,18 @@ class IntegracionWhatsAppTests(TestCase):
             )
         )
 
-        # =====================================================
+        # ==================================================
         # CONVERSACIÓN
-        # =====================================================
+        # ==================================================
 
         self.conversacion = crear_conversacion(
             numero_canal=self.canal,
-            sucursal=self.sucursal,
-            tipo="INDIVIDUAL",
-            privacidad="SIN_CLASIFICAR",
+            sucursal=None,
+            tipo=(
+                Conversacion
+                .TipoConversacion
+                .INDIVIDUAL
+            ),
             contacto=self.contacto,
         )
 
@@ -113,11 +134,14 @@ class IntegracionWhatsAppTests(TestCase):
             "whatsapp:webhook"
         )
 
-    # =========================================================
+    # ==========================================================
     # UTILIDADES
-    # =========================================================
+    # ==========================================================
 
-    def _firma_meta(self, body: bytes) -> str:
+    def _firma_meta(
+        self,
+        body: bytes,
+    ) -> str:
 
         digest = hmac.new(
             b"app_secret_test_456",
@@ -127,17 +151,26 @@ class IntegracionWhatsAppTests(TestCase):
 
         return f"sha256={digest}"
 
-    def _post_webhook(self, payload):
+    def _post_webhook(
+        self,
+        payload,
+    ):
 
         body = json.dumps(
             payload
-        ).encode("utf-8")
+        ).encode(
+            "utf-8"
+        )
 
         return self.client.post(
             self.webhook_url,
             data=body,
             content_type="application/json",
-            HTTP_X_HUB_SIGNATURE_256=self._firma_meta(body),
+            HTTP_X_HUB_SIGNATURE_256=(
+                self._firma_meta(
+                    body
+                )
+            ),
         )
 
     def _payload_texto(
@@ -150,41 +183,57 @@ class IntegracionWhatsAppTests(TestCase):
     ):
 
         return {
-            "object": "whatsapp_business_account",
+            "object":
+                "whatsapp_business_account",
+
             "entry": [
                 {
-                    "id": "WABA_TEST",
+                    "id":
+                        "WABA_TEST",
+
                     "changes": [
                         {
-                            "field": "messages",
+                            "field":
+                                "messages",
+
                             "value": {
-                                "messaging_product": "whatsapp",
+                                "messaging_product":
+                                    "whatsapp",
+
                                 "metadata": {
                                     "display_phone_number":
                                         "593981577789",
+
                                     "phone_number_id":
                                         phone_number_id,
                                 },
+
                                 "contacts": [
                                     {
                                         "profile": {
                                             "name":
                                                 "Cliente Prueba",
                                         },
+
                                         "wa_id":
                                             wa_id,
                                     }
                                 ],
+
                                 "messages": [
                                     {
                                         "from":
                                             wa_id,
+
                                         "id":
                                             wamid,
+
                                         "timestamp":
                                             "1787461200",
+
                                         "type":
                                             "text",
+
                                         "text": {
                                             "body":
                                                 texto,
@@ -204,34 +253,57 @@ class IntegracionWhatsAppTests(TestCase):
         wamid,
         status,
         phone_number_id="999999999",
+        errors=None,
     ):
 
+        status_data = {
+            "id":
+                wamid,
+
+            "status":
+                status,
+
+            "timestamp":
+                "1787461200",
+
+            "recipient_id":
+                "593990000001",
+        }
+
+        if errors is not None:
+
+            status_data[
+                "errors"
+            ] = errors
+
         return {
-            "object": "whatsapp_business_account",
+            "object":
+                "whatsapp_business_account",
+
             "entry": [
                 {
-                    "id": "WABA_TEST",
+                    "id":
+                        "WABA_TEST",
+
                     "changes": [
                         {
-                            "field": "messages",
+                            "field":
+                                "messages",
+
                             "value": {
                                 "messaging_product":
                                     "whatsapp",
+
                                 "metadata": {
+                                    "display_phone_number":
+                                        "593981577789",
+
                                     "phone_number_id":
                                         phone_number_id,
                                 },
+
                                 "statuses": [
-                                    {
-                                        "id":
-                                            wamid,
-                                        "status":
-                                            status,
-                                        "timestamp":
-                                            "1787461200",
-                                        "recipient_id":
-                                            "593990000001",
-                                    }
+                                    status_data
                                 ],
                             },
                         }
@@ -240,18 +312,23 @@ class IntegracionWhatsAppTests(TestCase):
             ],
         }
 
-    # =========================================================
+    # ==========================================================
     # WEBHOOK - VERIFICACIÓN GET
-    # =========================================================
+    # ==========================================================
 
-    def test_webhook_verificacion_correcta(self):
+    def test_webhook_verificacion_correcta(
+        self,
+    ):
 
         response = self.client.get(
             self.webhook_url,
             {
-                "hub.mode": "subscribe",
+                "hub.mode":
+                    "subscribe",
+
                 "hub.verify_token":
                     "verify_test_123",
+
                 "hub.challenge":
                     "CHALLENGE_TEST",
             },
@@ -267,14 +344,19 @@ class IntegracionWhatsAppTests(TestCase):
             "CHALLENGE_TEST",
         )
 
-    def test_webhook_verificacion_token_incorrecto(self):
+    def test_webhook_verificacion_token_incorrecto(
+        self,
+    ):
 
         response = self.client.get(
             self.webhook_url,
             {
-                "hub.mode": "subscribe",
+                "hub.mode":
+                    "subscribe",
+
                 "hub.verify_token":
                     "token_incorrecto",
+
                 "hub.challenge":
                     "CHALLENGE_TEST",
             },
@@ -285,17 +367,21 @@ class IntegracionWhatsAppTests(TestCase):
             403,
         )
 
-    # =========================================================
+    # ==========================================================
     # WEBHOOK - FIRMA HMAC
-    # =========================================================
+    # ==========================================================
 
-    def test_webhook_rechaza_firma_incorrecta(self):
+    def test_webhook_rechaza_firma_incorrecta(
+        self,
+    ):
 
         payload = self._payload_texto()
 
         body = json.dumps(
             payload
-        ).encode("utf-8")
+        ).encode(
+            "utf-8"
+        )
 
         response = self.client.post(
             self.webhook_url,
@@ -311,11 +397,16 @@ class IntegracionWhatsAppTests(TestCase):
             403,
         )
 
-    def test_webhook_acepta_firma_correcta(self):
+    def test_webhook_acepta_firma_correcta(
+        self,
+    ):
 
         payload = {
-            "object": "whatsapp_business_account",
-            "entry": [],
+            "object":
+                "whatsapp_business_account",
+
+            "entry":
+                [],
         }
 
         response = self._post_webhook(
@@ -327,14 +418,16 @@ class IntegracionWhatsAppTests(TestCase):
             200,
         )
 
-    # =========================================================
+    # ==========================================================
     # RECEPCIÓN DE MENSAJES
-    # =========================================================
+    # ==========================================================
 
-    def test_recibe_y_guarda_mensaje_entrante(self):
+    def test_recibe_y_guarda_mensaje_entrante(
+        self,
+    ):
 
-        # Evitamos utilizar la conversación creada en setUp
-        # para comprobar creación completa desde webhook.
+        # Eliminamos los datos existentes para probar
+        # creación completa desde el webhook.
 
         self.conversacion.delete()
         self.identidad.delete()
@@ -355,7 +448,9 @@ class IntegracionWhatsAppTests(TestCase):
         )
 
         mensaje = Mensaje.objects.get(
-            external_id="wamid.TEST.IN.100"
+            external_id=(
+                "wamid.TEST.IN.100"
+            )
         )
 
         self.assertEqual(
@@ -378,18 +473,44 @@ class IntegracionWhatsAppTests(TestCase):
             self.canal,
         )
 
+        # El canal corporativo puede iniciar una
+        # conversación sin sucursal asignada.
+        self.assertIsNone(
+            mensaje.conversacion.sucursal
+        )
+
         self.assertTrue(
             mensaje.conversacion.pendiente
         )
 
-    # =========================================================
-    # IDEMPOTENCIA
-    # =========================================================
+        # Comprobamos además que se conserva metadata
+        # técnica de Meta.
+        self.assertEqual(
+            mensaje.metadata.get(
+                "proveedor"
+            ),
+            "META",
+        )
 
-    def test_webhook_no_duplica_mismo_wamid(self):
+        self.assertEqual(
+            mensaje.metadata.get(
+                "phone_number_id"
+            ),
+            "999999999",
+        )
+
+    # ==========================================================
+    # IDEMPOTENCIA
+    # ==========================================================
+
+    def test_webhook_no_duplica_mismo_wamid(
+        self,
+    ):
 
         payload = self._payload_texto(
-            wamid="wamid.TEST.DUPLICADO.001",
+            wamid=(
+                "wamid.TEST.DUPLICADO.001"
+            ),
         )
 
         response_1 = self._post_webhook(
@@ -411,7 +532,9 @@ class IntegracionWhatsAppTests(TestCase):
         )
 
         cantidad = Mensaje.objects.filter(
-            external_id="wamid.TEST.DUPLICADO.001"
+            external_id=(
+                "wamid.TEST.DUPLICADO.001"
+            )
         ).count()
 
         self.assertEqual(
@@ -419,15 +542,21 @@ class IntegracionWhatsAppTests(TestCase):
             1,
         )
 
-    # =========================================================
+    # ==========================================================
     # CANAL DESCONOCIDO
-    # =========================================================
+    # ==========================================================
 
-    def test_webhook_ignora_phone_number_id_desconocido(self):
+    def test_webhook_ignora_phone_number_id_desconocido(
+        self,
+    ):
 
         payload = self._payload_texto(
-            wamid="wamid.TEST.UNKNOWN.CHANNEL",
-            phone_number_id="111111111111111",
+            wamid=(
+                "wamid.TEST.UNKNOWN.CHANNEL"
+            ),
+            phone_number_id=(
+                "111111111111111"
+            ),
         )
 
         response = self._post_webhook(
@@ -449,11 +578,13 @@ class IntegracionWhatsAppTests(TestCase):
             existe
         )
 
-    # =========================================================
+    # ==========================================================
     # CONTACTO / IDENTIDAD META
-    # =========================================================
+    # ==========================================================
 
-    def test_reutiliza_contacto_por_identidad_meta(self):
+    def test_reutiliza_contacto_por_identidad_meta(
+        self,
+    ):
 
         contacto, creado = (
             obtener_o_crear_contacto_whatsapp(
@@ -471,7 +602,9 @@ class IntegracionWhatsAppTests(TestCase):
             self.contacto.pk,
         )
 
-    def test_crea_contacto_e_identidad_meta(self):
+    def test_crea_contacto_e_identidad_meta(
+        self,
+    ):
 
         contacto, creado = (
             obtener_o_crear_contacto_whatsapp(
@@ -487,8 +620,9 @@ class IntegracionWhatsAppTests(TestCase):
         identidad = (
             IdentidadContactoExterna.objects.get(
                 proveedor="META",
-                identificador_externo=
-                    "593990000777",
+                identificador_externo=(
+                    "593990000777"
+                ),
             )
         )
 
@@ -497,17 +631,22 @@ class IntegracionWhatsAppTests(TestCase):
             contacto,
         )
 
-    # =========================================================
+    # ==========================================================
     # CONVERSACIÓN
-    # =========================================================
+    # ==========================================================
 
-    def test_reutiliza_conversacion_individual(self):
+    def test_reutiliza_conversacion_individual(
+        self,
+    ):
 
         conversacion_2 = crear_conversacion(
             numero_canal=self.canal,
-            sucursal=self.sucursal,
-            tipo="INDIVIDUAL",
-            privacidad="SIN_CLASIFICAR",
+            sucursal=None,
+            tipo=(
+                Conversacion
+                .TipoConversacion
+                .INDIVIDUAL
+            ),
             contacto=self.contacto,
         )
 
@@ -516,31 +655,47 @@ class IntegracionWhatsAppTests(TestCase):
             self.conversacion.pk,
         )
 
-    # =========================================================
-    # ESTADOS DE MENSAJES
-    # =========================================================
+    # ==========================================================
+    # ESTADOS
+    # ==========================================================
 
-    def test_estado_enviado_entregado_leido(self):
+    def test_estado_enviado_entregado_leido(
+        self,
+    ):
 
         mensaje = Mensaje.objects.create(
             conversacion=self.conversacion,
-            external_id="wamid.TEST.OUT.STATUS",
-            direccion=(
-                Mensaje.DireccionMensaje.SALIENTE
+            external_id=(
+                "wamid.TEST.OUT.STATUS"
             ),
-            tipo=Mensaje.TipoMensaje.TEXT,
+            direccion=(
+                Mensaje
+                .DireccionMensaje
+                .SALIENTE
+            ),
+            tipo=(
+                Mensaje
+                .TipoMensaje
+                .TEXT
+            ),
             texto_original="Mensaje prueba",
-            estado=Mensaje.EstadoMensaje.ENVIADO,
+            estado=(
+                Mensaje
+                .EstadoMensaje
+                .ENVIADO
+            ),
             fecha_mensaje=timezone.now(),
         )
 
-        # -----------------------------------------------------
+        # ==================================================
         # DELIVERED
-        # -----------------------------------------------------
+        # ==================================================
 
         response = self._post_webhook(
             self._payload_status(
-                wamid="wamid.TEST.OUT.STATUS",
+                wamid=(
+                    "wamid.TEST.OUT.STATUS"
+                ),
                 status="delivered",
             )
         )
@@ -557,13 +712,15 @@ class IntegracionWhatsAppTests(TestCase):
             Mensaje.EstadoMensaje.ENTREGADO,
         )
 
-        # -----------------------------------------------------
+        # ==================================================
         # READ
-        # -----------------------------------------------------
+        # ==================================================
 
         response = self._post_webhook(
             self._payload_status(
-                wamid="wamid.TEST.OUT.STATUS",
+                wamid=(
+                    "wamid.TEST.OUT.STATUS"
+                ),
                 status="read",
             )
         )
@@ -580,23 +737,39 @@ class IntegracionWhatsAppTests(TestCase):
             Mensaje.EstadoMensaje.LEIDO,
         )
 
-    def test_estado_no_regresa_de_leido_a_enviado(self):
+    def test_estado_no_regresa_de_leido_a_enviado(
+        self,
+    ):
 
         mensaje = Mensaje.objects.create(
             conversacion=self.conversacion,
-            external_id="wamid.TEST.MONOTONICO",
-            direccion=(
-                Mensaje.DireccionMensaje.SALIENTE
+            external_id=(
+                "wamid.TEST.MONOTONICO"
             ),
-            tipo=Mensaje.TipoMensaje.TEXT,
+            direccion=(
+                Mensaje
+                .DireccionMensaje
+                .SALIENTE
+            ),
+            tipo=(
+                Mensaje
+                .TipoMensaje
+                .TEXT
+            ),
             texto_original="Mensaje prueba",
-            estado=Mensaje.EstadoMensaje.LEIDO,
+            estado=(
+                Mensaje
+                .EstadoMensaje
+                .LEIDO
+            ),
             fecha_mensaje=timezone.now(),
         )
 
         self._post_webhook(
             self._payload_status(
-                wamid="wamid.TEST.MONOTONICO",
+                wamid=(
+                    "wamid.TEST.MONOTONICO"
+                ),
                 status="sent",
             )
         )
@@ -608,17 +781,31 @@ class IntegracionWhatsAppTests(TestCase):
             Mensaje.EstadoMensaje.LEIDO,
         )
 
-    def test_estado_fallido_se_registra(self):
+    def test_estado_fallido_se_registra(
+        self,
+    ):
 
         mensaje = Mensaje.objects.create(
             conversacion=self.conversacion,
-            external_id="wamid.TEST.FAILED",
-            direccion=(
-                Mensaje.DireccionMensaje.SALIENTE
+            external_id=(
+                "wamid.TEST.FAILED"
             ),
-            tipo=Mensaje.TipoMensaje.TEXT,
+            direccion=(
+                Mensaje
+                .DireccionMensaje
+                .SALIENTE
+            ),
+            tipo=(
+                Mensaje
+                .TipoMensaje
+                .TEXT
+            ),
             texto_original="Mensaje prueba",
-            estado=Mensaje.EstadoMensaje.ENVIADO,
+            estado=(
+                Mensaje
+                .EstadoMensaje
+                .ENVIADO
+            ),
             fecha_mensaje=timezone.now(),
         )
 
@@ -626,6 +813,13 @@ class IntegracionWhatsAppTests(TestCase):
             self._payload_status(
                 wamid="wamid.TEST.FAILED",
                 status="failed",
+                errors=[
+                    {
+                        "code": 131026,
+                        "message":
+                            "Message undeliverable",
+                    }
+                ],
             )
         )
 
@@ -636,11 +830,18 @@ class IntegracionWhatsAppTests(TestCase):
             Mensaje.EstadoMensaje.FALLIDO,
         )
 
-    # =========================================================
-    # PARSER
-    # =========================================================
+        self.assertEqual(
+            mensaje.error_codigo,
+            "131026",
+        )
 
-    def test_parser_texto(self):
+    # ==========================================================
+    # PARSER
+    # ==========================================================
+
+    def test_parser_texto(
+        self,
+    ):
 
         payload = self._payload_texto(
             wamid="wamid.TEST.PARSER",
@@ -673,12 +874,22 @@ class IntegracionWhatsAppTests(TestCase):
             "999999999",
         )
 
-    def test_parser_tipo_desconocido(self):
+        self.assertEqual(
+            evento["display_phone_number"],
+            "593981577789",
+        )
 
-        payload = self._payload_texto()
+        self.assertEqual(
+            evento["tipo"],
+            Mensaje.TipoMensaje.TEXT,
+        )
+
+    def test_parser_tipo_desconocido(
+        self,
+    ):
 
         payload = copy.deepcopy(
-            payload
+            self._payload_texto()
         )
 
         mensaje = (
@@ -687,7 +898,9 @@ class IntegracionWhatsAppTests(TestCase):
             ["value"]["messages"][0]
         )
 
-        mensaje["type"] = "tipo_no_soportado"
+        mensaje[
+            "type"
+        ] = "tipo_no_soportado"
 
         mensaje.pop(
             "text",
@@ -708,9 +921,9 @@ class IntegracionWhatsAppTests(TestCase):
             Mensaje.TipoMensaje.UNKNOWN,
         )
 
-    # =========================================================
+    # ==========================================================
     # CLIENTE META
-    # =========================================================
+    # ==========================================================
 
     @patch(
         "integraciones.whatsapp.client.requests.post"
@@ -722,16 +935,23 @@ class IntegracionWhatsAppTests(TestCase):
 
         response_mock = MagicMock()
 
+        response_mock.ok = True
+        response_mock.status_code = 200
+
         response_mock.json.return_value = {
-            "messaging_product": "whatsapp",
+            "messaging_product":
+                "whatsapp",
+
             "contacts": [
                 {
                     "input":
                         "593990000001",
+
                     "wa_id":
                         "593990000001",
                 }
             ],
+
             "messages": [
                 {
                     "id":
@@ -740,10 +960,6 @@ class IntegracionWhatsAppTests(TestCase):
             ],
         }
 
-        response_mock.raise_for_status.return_value = (
-            None
-        )
-
         mock_post.return_value = (
             response_mock
         )
@@ -751,7 +967,9 @@ class IntegracionWhatsAppTests(TestCase):
         resultado = enviar_mensaje_texto_meta(
             phone_number_id="999999999",
             wa_id="593990000001",
-            text="Hola desde MAO Comunicaciones",
+            text=(
+                "Hola desde MAO Comunicaciones"
+            ),
         )
 
         self.assertTrue(
@@ -765,9 +983,9 @@ class IntegracionWhatsAppTests(TestCase):
 
         mock_post.assert_called_once()
 
-    # =========================================================
-    # SERVICIO DE ENVÍO SALIENTE
-    # =========================================================
+    # ==========================================================
+    # ENVÍO SALIENTE
+    # ==========================================================
 
     @patch(
         "integraciones.whatsapp.services."
@@ -809,30 +1027,60 @@ class IntegracionWhatsAppTests(TestCase):
             "Hola cliente",
         )
 
+        self.assertEqual(
+            mensaje.metadata.get(
+                "wamid"
+            ),
+            "wamid.TEST.OUT.001",
+        )
+
         mock_enviar.assert_called_once_with(
             phone_number_id="999999999",
             wa_id="593990000001",
             text="Hola cliente",
         )
 
+    # ==========================================================
+    # FALLO DE META
+    # ==========================================================
+    #
+    # En el diseño nuevo NO eliminamos el intento.
+    #
+    # Se conserva:
+    #
+    #     PENDIENTE -> FALLIDO
+    #
+    # Esto permite auditoría, reintentos y diagnóstico.
+    # ==========================================================
+
     @patch(
         "integraciones.whatsapp.services."
         "enviar_mensaje_texto_meta"
     )
-    def test_fallo_meta_no_persiste_mensaje(
+    def test_fallo_meta_persiste_mensaje_fallido(
         self,
         mock_enviar,
     ):
 
         mock_enviar.return_value = {
-            "error": "Network Error",
+            "success": False,
+
+            "error": {
+                "type":
+                    "network_error",
+
+                "message":
+                    "Error de red",
+            },
         }
 
         cantidad_antes = (
             Mensaje.objects.count()
         )
 
-        with self.assertRaises(Exception):
+        with self.assertRaises(
+            WhatsAppEnvioError
+        ):
 
             enviar_mensaje_saliente(
                 self.conversacion,
@@ -844,15 +1092,36 @@ class IntegracionWhatsAppTests(TestCase):
         )
 
         self.assertEqual(
-            cantidad_antes,
             cantidad_despues,
+            cantidad_antes + 1,
+        )
+
+        mensaje = (
+            Mensaje.objects
+            .order_by("-pk")
+            .first()
+        )
+
+        self.assertEqual(
+            mensaje.estado,
+            Mensaje.EstadoMensaje.FALLIDO,
+        )
+
+        self.assertEqual(
+            mensaje.direccion,
+            Mensaje.DireccionMensaje.SALIENTE,
+        )
+
+        self.assertEqual(
+            mensaje.texto_original,
+            "Mensaje que fallará",
         )
 
     @patch(
         "integraciones.whatsapp.services."
         "enviar_mensaje_texto_meta"
     )
-    def test_meta_sin_wamid_no_persiste_mensaje(
+    def test_meta_sin_wamid_persiste_mensaje_fallido(
         self,
         mock_enviar,
     ):
@@ -866,7 +1135,9 @@ class IntegracionWhatsAppTests(TestCase):
             Mensaje.objects.count()
         )
 
-        with self.assertRaises(Exception):
+        with self.assertRaises(
+            WhatsAppEnvioError
+        ):
 
             enviar_mensaje_saliente(
                 self.conversacion,
@@ -878,20 +1149,36 @@ class IntegracionWhatsAppTests(TestCase):
         )
 
         self.assertEqual(
-            cantidad_antes,
             cantidad_despues,
+            cantidad_antes + 1,
         )
 
-    # =========================================================
+        mensaje = (
+            Mensaje.objects
+            .order_by("-pk")
+            .first()
+        )
+
+        self.assertEqual(
+            mensaje.estado,
+            Mensaje.EstadoMensaje.FALLIDO,
+        )
+
+        self.assertEqual(
+            mensaje.error_codigo,
+            "META_WAMID_MISSING",
+        )
+
+    # ==========================================================
     # MULTIMEDIA ENTRANTE
-    # =========================================================
+    # ==========================================================
 
     @patch(
-        "integraciones.whatsapp.views."
+        "integraciones.whatsapp.services."
         "descargar_archivo_fisico"
     )
     @patch(
-        "integraciones.whatsapp.views."
+        "integraciones.whatsapp.services."
         "obtener_url_descarga_media"
     )
     def test_guarda_multimedia_entrante(
@@ -924,7 +1211,13 @@ class IntegracionWhatsAppTests(TestCase):
                                 "messages",
 
                             "value": {
+                                "messaging_product":
+                                    "whatsapp",
+
                                 "metadata": {
+                                    "display_phone_number":
+                                        "593981577789",
+
                                     "phone_number_id":
                                         "999999999",
                                 },
@@ -984,12 +1277,25 @@ class IntegracionWhatsAppTests(TestCase):
         )
 
         mensaje = Mensaje.objects.get(
-            external_id=
+            external_id=(
                 "wamid.TEST.IMAGE.001"
+            )
         )
 
-        archivo = ArchivoMultimedia.objects.get(
-            mensaje=mensaje
+        self.assertEqual(
+            mensaje.tipo,
+            Mensaje.TipoMensaje.IMAGE,
+        )
+
+        self.assertEqual(
+            mensaje.texto_original,
+            "Foto prueba",
+        )
+
+        archivo = (
+            ArchivoMultimedia.objects.get(
+                mensaje=mensaje
+            )
         )
 
         self.assertEqual(
@@ -1005,4 +1311,10 @@ class IntegracionWhatsAppTests(TestCase):
         self.assertGreater(
             archivo.size_bytes,
             0,
+        )
+
+        self.assertTrue(
+            bool(
+                archivo.archivo
+            )
         )

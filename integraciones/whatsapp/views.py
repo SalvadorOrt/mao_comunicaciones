@@ -1,9 +1,10 @@
+# integraciones/whatsapp/views.py
+
 import json
 import logging
-import mimetypes
+import secrets
 
 from django.conf import settings
-from django.core.files.base import ContentFile
 from django.http import (
     HttpResponse,
     HttpResponseForbidden,
@@ -12,139 +13,231 @@ from django.http import (
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from comunicaciones.models import (
-    ArchivoMultimedia,
-    Conversacion,
-    Mensaje,
-    NumeroCanal,
-)
-from comunicaciones.services import (
-    crear_conversacion,
-    obtener_o_crear_contacto_whatsapp,
-    registrar_mensaje_idempotente,
-)
-from integraciones.whatsapp.client import (
-    descargar_archivo_fisico,
-    obtener_url_descarga_media,
-)
 from integraciones.whatsapp.parser import (
     parse_whatsapp_payload,
+)
+from integraciones.whatsapp.services import (
+    procesar_evento_webhook,
 )
 from integraciones.whatsapp.signature import (
     validate_hub_signature,
 )
 
 
-logger = logging.getLogger("django")
+logger = logging.getLogger(__name__)
 
 
 # ==========================================================
-# WEBHOOK PRINCIPAL
+# WEBHOOK WHATSAPP
 # ==========================================================
 
 
 @csrf_exempt
-@require_http_methods(["GET", "POST"])
-def whatsapp_webhook_view(request):
+@require_http_methods(
+    [
+        "GET",
+        "POST",
+    ]
+)
+def whatsapp_webhook_view(
+    request,
+):
     """
-    Endpoint principal del webhook de WhatsApp Cloud API.
+    Endpoint público utilizado por WhatsApp Cloud API.
 
     GET:
-        Verificación inicial realizada por Meta.
+        Meta verifica que el webhook pertenece
+        a MAO Comunicaciones.
 
     POST:
-        Recepción y procesamiento de eventos.
-    """
+        Meta entrega mensajes y estados.
 
-    # ======================================================
-    # GET - VERIFICACIÓN DE META
-    # ======================================================
+    Esta vista únicamente maneja HTTP y seguridad.
+
+    La lógica de comunicación se delega a:
+
+        parser.py
+        services.py
+        client.py
+    """
 
     if request.method == "GET":
 
-        mode = request.GET.get(
+        return _verificar_webhook_meta(
+            request
+        )
+
+    return _recibir_evento_meta(
+        request
+    )
+
+
+# ==========================================================
+# VERIFICACIÓN DEL WEBHOOK
+# ==========================================================
+
+
+def _verificar_webhook_meta(
+    request,
+):
+    """
+    Atiende la verificación inicial realizada por Meta.
+    """
+
+    mode = str(
+        request.GET.get(
             "hub.mode"
         )
+        or ""
+    ).strip()
 
-        token = request.GET.get(
+    token_recibido = str(
+        request.GET.get(
             "hub.verify_token"
         )
+        or ""
+    ).strip()
 
-        challenge = request.GET.get(
-            "hub.challenge"
-        )
+    challenge = request.GET.get(
+        "hub.challenge"
+    )
 
-        meta_verify_token = getattr(
+    token_esperado = str(
+        getattr(
             settings,
             "META_VERIFY_TOKEN",
-            None,
+            "",
         )
+        or ""
+    ).strip()
 
-        if not meta_verify_token:
+    # ======================================================
+    # CONFIGURACIÓN
+    # ======================================================
 
-            logger.error(
-                "META_VERIFY_TOKEN no está configurado."
-            )
+    if not token_esperado:
 
-            return HttpResponseForbidden(
-                "Falta configuración de verificación."
-            )
-
-        if (
-            mode == "subscribe"
-            and token == meta_verify_token
-        ):
-
-            logger.info(
-                "Verificación del webhook de Meta "
-                "realizada correctamente."
-            )
-
-            return HttpResponse(
-                challenge,
-                status=200,
-            )
-
-        logger.warning(
-            "Intento de verificación del webhook "
-            "con token inválido."
+        logger.error(
+            "META_VERIFY_TOKEN no está configurado."
         )
 
         return HttpResponseForbidden(
-            "Token de verificación inválido."
+            "Webhook no configurado."
         )
 
     # ======================================================
-    # POST - EVENTOS DE META
+    # VALIDACIÓN
     # ======================================================
 
-    signature_header = request.headers.get(
-        "X-Hub-Signature-256",
-        "",
+    if (
+        mode != "subscribe"
+        or not token_recibido
+        or not secrets.compare_digest(
+            token_recibido,
+            token_esperado,
+        )
+    ):
+
+        logger.warning(
+            (
+                "Intento inválido de verificación "
+                "del webhook de Meta."
+            )
+        )
+
+        return HttpResponseForbidden(
+            "Verificación inválida."
+        )
+
+    # ======================================================
+    # CHALLENGE
+    # ======================================================
+
+    if challenge is None:
+
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Missing challenge",
+            },
+            status=400,
+        )
+
+    logger.info(
+        "Webhook de Meta verificado correctamente."
+    )
+
+    return HttpResponse(
+        challenge,
+        status=200,
+    )
+
+
+# ==========================================================
+# RECEPCIÓN DE EVENTOS
+# ==========================================================
+
+
+def _recibir_evento_meta(
+    request,
+):
+    """
+    Recibe eventos enviados por Meta.
+
+    Flujo:
+
+        request.body
+              ↓
+        validar HMAC
+              ↓
+        JSON
+              ↓
+        parser
+              ↓
+        eventos normalizados
+              ↓
+        whatsapp/services.py
+    """
+
+    raw_body = request.body
+
+    signature_header = (
+        request.headers.get(
+            "X-Hub-Signature-256",
+            "",
+        )
     )
 
     # ======================================================
-    # VALIDAR FIRMA ANTES DE INTERPRETAR EL JSON
+    # FIRMA HMAC
     # ======================================================
 
     if not validate_hub_signature(
-        request.body,
+        raw_body,
         signature_header,
     ):
 
+        logger.warning(
+            (
+                "Webhook de Meta rechazado "
+                "por firma inválida."
+            )
+        )
+
         return HttpResponseForbidden(
-            "Firma de autenticidad inválida "
-            "o ausente."
+            "Firma inválida."
         )
 
     # ======================================================
-    # DECODIFICAR JSON
+    # JSON
     # ======================================================
 
     try:
 
         payload = json.loads(
-            request.body.decode("utf-8")
+            raw_body.decode(
+                "utf-8"
+            )
         )
 
     except (
@@ -153,8 +246,7 @@ def whatsapp_webhook_view(request):
     ):
 
         logger.warning(
-            "Meta envió un payload que no pudo "
-            "decodificarse como JSON."
+            "Meta envió JSON inválido."
         )
 
         return JsonResponse(
@@ -165,39 +257,77 @@ def whatsapp_webhook_view(request):
             status=400,
         )
 
+    if not isinstance(
+        payload,
+        dict,
+    ):
+
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Invalid payload",
+            },
+            status=400,
+        )
+
     # ======================================================
-    # NORMALIZAR EVENTOS
+    # PARSER
     # ======================================================
 
-    eventos = parse_whatsapp_payload(
-        payload
-    )
+    try:
+
+        eventos = parse_whatsapp_payload(
+            payload
+        )
+
+    except Exception:
+
+        logger.exception(
+            (
+                "Error normalizando payload "
+                "de WhatsApp."
+            )
+        )
+
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": (
+                    "Payload parsing error"
+                ),
+            },
+            status=500,
+        )
+
+    if eventos is None:
+        eventos = []
 
     # ======================================================
     # PROCESAR
-    # ======================================================
-    #
-    # Si ocurre una falla interna inesperada,
-    # devolvemos 500.
-    #
-    # Meta podrá reintentar el webhook y nuestra
-    # idempotencia evita duplicar mensajes.
     # ======================================================
 
     try:
 
         for evento in eventos:
-            _procesar_evento_webhook(
+
+            procesar_evento_webhook(
                 evento
             )
 
     except Exception:
 
         logger.exception(
-            "Error procesando un evento del "
-            "webhook de WhatsApp."
+            (
+                "Error procesando evento "
+                "del webhook de WhatsApp."
+            )
         )
 
+        # Respondemos 500 para que Meta pueda reintentar.
+        #
+        # Los mensajes utilizan idempotencia mediante
+        # external_id, por lo que un reintento no debería
+        # duplicar el mismo mensaje.
         return JsonResponse(
             {
                 "status": "error",
@@ -208,462 +338,11 @@ def whatsapp_webhook_view(request):
             status=500,
         )
 
+    # ======================================================
+    # OK
+    # ======================================================
+
     return HttpResponse(
         "EVENT_RECEIVED",
         status=200,
-    )
-
-
-# ==========================================================
-# ROUTER DE EVENTOS
-# ==========================================================
-
-
-def _procesar_evento_webhook(
-    evento: dict,
-):
-    """
-    Procesa un evento normalizado.
-
-    El phone_number_id recibido desde Meta identifica
-    dinámicamente qué NumeroCanal recibió el evento.
-    """
-
-    phone_number_id = evento.get(
-        "phone_number_id"
-    )
-
-    if not phone_number_id:
-
-        logger.warning(
-            "Evento de Meta sin phone_number_id."
-        )
-
-        return
-
-    # ======================================================
-    # RESOLVER CANAL
-    # ======================================================
-
-    canal = (
-        NumeroCanal.objects
-        .select_related(
-            "sucursal",
-        )
-        .filter(
-            identificador_externo=phone_number_id,
-            activo=True,
-        )
-        .first()
-    )
-
-    if not canal:
-
-        logger.warning(
-            "Webhook recibido para un "
-            "phone_number_id no registrado: %s",
-            phone_number_id,
-        )
-
-        return
-
-    tipo_evento = evento.get(
-        "tipo_evento"
-    )
-
-    # ======================================================
-    # ESTADO
-    # ======================================================
-
-    if tipo_evento == "status":
-
-        _actualizar_estado_mensaje(
-            evento,
-            canal,
-        )
-
-        return
-
-    # ======================================================
-    # MENSAJE ENTRANTE
-    # ======================================================
-
-    if tipo_evento == "message":
-
-        _procesar_mensaje_entrante(
-            evento,
-            canal,
-        )
-
-        return
-
-    logger.debug(
-        "Tipo de evento Meta ignorado: %s",
-        tipo_evento,
-    )
-
-
-# ==========================================================
-# ACTUALIZAR ESTADO
-# ==========================================================
-
-
-def _actualizar_estado_mensaje(
-    evento: dict,
-    canal: NumeroCanal,
-):
-    """
-    Actualiza el estado de un mensaje saliente.
-
-    Estados normales:
-
-        ENVIADO
-          ↓
-        ENTREGADO
-          ↓
-        LEIDO
-
-    FALLIDO se considera terminal.
-    """
-
-    external_id = evento.get(
-        "external_id"
-    )
-
-    nuevo_estado = evento.get(
-        "estado"
-    )
-
-    if not external_id or not nuevo_estado:
-        return
-
-    mensaje = (
-        Mensaje.objects
-        .filter(
-            external_id=external_id,
-            conversacion__numero_canal=canal,
-        )
-        .first()
-    )
-
-    if not mensaje:
-
-        logger.debug(
-            "Estado recibido para un mensaje "
-            "no registrado. external_id=%s",
-            external_id,
-        )
-
-        return
-
-    # ======================================================
-    # FALLIDO YA ES TERMINAL
-    # ======================================================
-
-    if (
-        mensaje.estado
-        == Mensaje.EstadoMensaje.FALLIDO
-    ):
-        return
-
-    # ======================================================
-    # META REPORTA FALLO
-    # ======================================================
-
-    if (
-        nuevo_estado
-        == Mensaje.EstadoMensaje.FALLIDO
-    ):
-
-        Mensaje.objects.filter(
-            pk=mensaje.pk
-        ).update(
-            estado=Mensaje.EstadoMensaje.FALLIDO
-        )
-
-        logger.error(
-            "Meta reportó fallo de entrega. "
-            "external_id=%s",
-            external_id,
-        )
-
-        return
-
-    # ======================================================
-    # PROGRESIÓN MONÓTONA
-    # ======================================================
-
-    orden_estados = {
-        Mensaje.EstadoMensaje.RECIBIDO: 0,
-        Mensaje.EstadoMensaje.ENVIADO: 1,
-        Mensaje.EstadoMensaje.ENTREGADO: 2,
-        Mensaje.EstadoMensaje.LEIDO: 3,
-    }
-
-    estado_actual_orden = (
-        orden_estados.get(
-            mensaje.estado,
-            0,
-        )
-    )
-
-    nuevo_estado_orden = (
-        orden_estados.get(
-            nuevo_estado
-        )
-    )
-
-    if nuevo_estado_orden is None:
-        return
-
-    if (
-        nuevo_estado_orden
-        <= estado_actual_orden
-    ):
-        return
-
-    Mensaje.objects.filter(
-        pk=mensaje.pk
-    ).update(
-        estado=nuevo_estado
-    )
-
-
-# ==========================================================
-# MENSAJE ENTRANTE
-# ==========================================================
-
-
-def _procesar_mensaje_entrante(
-    evento: dict,
-    canal: NumeroCanal,
-):
-    """
-    Persiste un mensaje recibido desde WhatsApp.
-    """
-
-    wa_id = evento.get(
-        "wa_id"
-    )
-
-    if not wa_id:
-
-        logger.warning(
-            "Mensaje recibido sin wa_id."
-        )
-
-        return
-
-    # ======================================================
-    # 1. CONTACTO
-    # ======================================================
-
-    contacto, _ = (
-        obtener_o_crear_contacto_whatsapp(
-            wa_id=wa_id,
-            nombre_perfil=evento.get(
-                "nombre_perfil"
-            ),
-        )
-    )
-
-    # ======================================================
-    # 2. CONVERSACIÓN
-    # ======================================================
-
-    conversacion = (
-        Conversacion.objects
-        .filter(
-            numero_canal=canal,
-            contacto=contacto,
-            tipo=(
-                Conversacion
-                .TipoConversacion
-                .INDIVIDUAL
-            ),
-        )
-        .first()
-    )
-
-    if not conversacion:
-
-        conversacion = crear_conversacion(
-            numero_canal=canal,
-            sucursal=canal.sucursal,
-            tipo=(
-                Conversacion
-                .TipoConversacion
-                .INDIVIDUAL
-            ),
-            privacidad=(
-                Conversacion
-                .PrivacidadConversacion
-                .SIN_CLASIFICAR
-            ),
-            contacto=contacto,
-        )
-
-    # ======================================================
-    # 3. MENSAJE AL QUE RESPONDE
-    # ======================================================
-
-    respuesta_a = None
-
-    respuesta_a_external_id = evento.get(
-        "respuesta_a_external_id"
-    )
-
-    if respuesta_a_external_id:
-
-        respuesta_a = (
-            Mensaje.objects
-            .filter(
-                conversacion=conversacion,
-                external_id=(
-                    respuesta_a_external_id
-                ),
-            )
-            .first()
-        )
-
-    # ======================================================
-    # 4. PERSISTIR
-    # ======================================================
-
-    mensaje, fue_creado = (
-        registrar_mensaje_idempotente(
-            conversacion=conversacion,
-            external_id=evento.get(
-                "external_id"
-            ),
-            direccion=evento.get(
-                "direccion"
-            ),
-            tipo=evento.get(
-                "tipo"
-            ),
-            texto_original=evento.get(
-                "texto_original"
-            ),
-            fecha_mensaje=evento.get(
-                "timestamp"
-            ),
-            remitente=contacto,
-            estado=(
-                Mensaje
-                .EstadoMensaje
-                .RECIBIDO
-            ),
-            respuesta_a=respuesta_a,
-        )
-    )
-
-    # ======================================================
-    # 5. MULTIMEDIA
-    # ======================================================
-
-    media_id = evento.get(
-        "media_id"
-    )
-
-    if fue_creado and media_id:
-
-        _descargar_y_guardar_multimedia(
-            mensaje,
-            media_id,
-        )
-
-
-# ==========================================================
-# MULTIMEDIA
-# ==========================================================
-
-
-def _descargar_y_guardar_multimedia(
-    mensaje: Mensaje,
-    media_id: str,
-):
-    """
-    Descarga un adjunto desde Meta.
-
-    Por ahora el proceso es síncrono.
-
-    Más adelante puede moverse a una cola de trabajos
-    sin modificar el contrato del webhook.
-    """
-
-    media_url = (
-        obtener_url_descarga_media(
-            media_id
-        )
-    )
-
-    content_bytes = None
-    mime_type = None
-
-    if media_url:
-
-        (
-            content_bytes,
-            mime_type,
-        ) = descargar_archivo_fisico(
-            media_url
-        )
-
-    # ======================================================
-    # DESCARGA CORRECTA
-    # ======================================================
-
-    if content_bytes:
-
-        extension = (
-            mimetypes.guess_extension(
-                mime_type or ""
-            )
-            or ".bin"
-        )
-
-        if extension == ".jpe":
-            extension = ".jpg"
-
-        file_name = (
-            f"{media_id}{extension}"
-        )
-
-        ArchivoMultimedia.objects.create(
-            mensaje=mensaje,
-            identificador_externo=media_id,
-            mime_type=(
-                mime_type
-                or "application/octet-stream"
-            ),
-            nombre_original=file_name,
-            size_bytes=len(
-                content_bytes
-            ),
-            archivo=ContentFile(
-                content_bytes,
-                name=file_name,
-            ),
-        )
-
-        return
-
-    # ======================================================
-    # DESCARGA PENDIENTE
-    # ======================================================
-
-    logger.warning(
-        "No fue posible descargar el archivo "
-        "de Meta. media_id=%s",
-        media_id,
-    )
-
-    ArchivoMultimedia.objects.create(
-        mensaje=mensaje,
-        identificador_externo=media_id,
-        mime_type="application/octet-stream",
-        nombre_original=(
-            f"pending_{media_id}.bin"
-        ),
     )

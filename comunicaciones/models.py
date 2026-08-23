@@ -1,4 +1,3 @@
-from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 
@@ -12,46 +11,118 @@ from organizacion.models import Sucursal
 
 class NumeroCanal(models.Model):
     """
-    Representa un canal o punto de comunicación empresarial.
+    Representa un punto de comunicación administrado por
+    MAO Comunicaciones.
 
-    Un canal puede tener una sucursal predeterminada y,
-    adicionalmente, estar habilitado para operar en varias
-    sucursales.
+    Ejemplos:
+
+        - WhatsApp principal de MAO.
+        - WhatsApp de un asesor.
+        - WhatsApp específico de MAO Norte.
+        - WhatsApp específico de MAO Sur.
+
+    La sucursal NO es propiedad de MAO Comunicaciones.
+
+    Cuando existe una relación con una sucursal, esta apunta
+    a una referencia local sincronizada desde MAO ERP.
+
+    Un canal corporativo puede no pertenecer a ninguna
+    sucursal concreta y operar para varias.
     """
+
+    # =====================================================
+    # PROVEEDOR
+    # =====================================================
+
+    class Proveedor(models.TextChoices):
+        WHATSAPP = "WHATSAPP", "WhatsApp"
+        OTRO = "OTRO", "Otro"
+
+    # =====================================================
+    # TIPO
+    # =====================================================
 
     class TipoCanal(models.TextChoices):
         CORPORATIVO = "CORPORATIVO", "Corporativo"
-        MIXTO = "MIXTO", "Mixto"
-        EXTERNO_PERSONAL = "EXTERNO_PERSONAL", "Externo Personal"
+        SUCURSAL = "SUCURSAL", "Sucursal"
+        ASESOR = "ASESOR", "Asesor"
+        OTRO = "OTRO", "Otro"
+
+    # =====================================================
+    # IDENTIFICACIÓN
+    # =====================================================
 
     nombre = models.CharField(
         max_length=255,
+    )
+
+    proveedor = models.CharField(
+        max_length=50,
+        choices=Proveedor.choices,
+        default=Proveedor.WHATSAPP,
+        db_index=True,
+    )
+
+    tipo = models.CharField(
+        max_length=50,
+        choices=TipoCanal.choices,
+        default=TipoCanal.CORPORATIVO,
+        db_index=True,
     )
 
     numero_telefonico = models.CharField(
         max_length=50,
         null=True,
         blank=True,
+        db_index=True,
     )
 
+    # Ejemplo para Meta:
+    #
+    #     phone_number_id
+    #
     identificador_externo = models.CharField(
         max_length=255,
         null=True,
         blank=True,
+        db_index=True,
+    )
+
+    # =====================================================
+    # CANAL PRINCIPAL
+    # =====================================================
+
+    es_principal = models.BooleanField(
+        default=False,
+        db_index=True,
     )
 
     # =====================================================
     # SUCURSAL PREDETERMINADA
     # =====================================================
+    #
+    # NULL significa:
+    #
+    #     canal corporativo / sin sucursal predeterminada.
+    #
+    # Nunca se crea una sucursal empresarial desde aquí.
+    # Es únicamente una referencia sincronizada desde ERP.
+    # =====================================================
 
     sucursal = models.ForeignKey(
         Sucursal,
         on_delete=models.PROTECT,
+        null=True,
+        blank=True,
         related_name="canales",
     )
 
     # =====================================================
     # SUCURSALES HABILITADAS
+    # =====================================================
+    #
+    # Permite que el mismo canal corporativo pueda operar
+    # para varias sucursales.
     # =====================================================
 
     sucursales_habilitadas = models.ManyToManyField(
@@ -61,67 +132,108 @@ class NumeroCanal(models.Model):
     )
 
     # =====================================================
-    # TIPO
+    # ESTADO
     # =====================================================
-
-    tipo = models.CharField(
-        max_length=50,
-        choices=TipoCanal.choices,
-        default=TipoCanal.CORPORATIVO,
-    )
-
-    # =====================================================
-    # PROPIETARIO
-    # =====================================================
-
-    propietario = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name="canales_propios",
-    )
-
-    # =====================================================
-    # USUARIOS AUTORIZADOS
-    # =====================================================
-
-    usuarios_autorizados = models.ManyToManyField(
-        settings.AUTH_USER_MODEL,
-        blank=True,
-        related_name="canales_autorizados",
-    )
 
     activo = models.BooleanField(
         default=True,
+        db_index=True,
     )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
+
+    # =====================================================
+    # META
+    # =====================================================
 
     class Meta:
         verbose_name = "Número/Canal"
         verbose_name_plural = "Números/Canales"
 
+        ordering = [
+            "-es_principal",
+            "nombre",
+        ]
+
+        constraints = [
+            # El identificador de un canal debe ser único
+            # dentro de un proveedor.
+            models.UniqueConstraint(
+                fields=[
+                    "proveedor",
+                    "identificador_externo",
+                ],
+                condition=models.Q(
+                    identificador_externo__isnull=False,
+                ),
+                name=(
+                    "unique_canal_proveedor_identificador"
+                ),
+            ),
+
+            # Solo un canal principal activo por proveedor.
+            models.UniqueConstraint(
+                fields=[
+                    "proveedor",
+                ],
+                condition=models.Q(
+                    es_principal=True,
+                    activo=True,
+                ),
+                name=(
+                    "unique_canal_principal_activo_proveedor"
+                ),
+            ),
+        ]
+
+    # =====================================================
+    # VALIDACIONES
+    # =====================================================
+
     def clean(self):
         super().clean()
 
-        if self.tipo in [
-            self.TipoCanal.MIXTO,
-            self.TipoCanal.EXTERNO_PERSONAL,
-        ]:
-            if not self.propietario:
-                raise ValidationError(
-                    {
-                        "propietario": (
-                            "Los canales de tipo MIXTO o "
-                            "EXTERNO_PERSONAL requieren un "
-                            "propietario asignado."
-                        )
-                    }
-                )
+        # Un canal marcado como SUCURSAL debe tener
+        # una sucursal predeterminada.
+        if (
+            self.tipo == self.TipoCanal.SUCURSAL
+            and not self.sucursal_id
+        ):
+            raise ValidationError(
+                {
+                    "sucursal": (
+                        "Un canal de tipo SUCURSAL debe "
+                        "tener una sucursal asociada."
+                    )
+                }
+            )
+
+    # =====================================================
+    # SUCURSALES
+    # =====================================================
 
     def permite_sucursal(self, sucursal):
+        """
+        Indica si este canal puede utilizarse para una
+        determinada sucursal.
+
+        La sucursal recibida siempre debe ser una referencia
+        local sincronizada desde MAO ERP.
+        """
+
         if not sucursal:
             return False
 
+        if not sucursal.activa:
+            return False
+
+        # Sucursal predeterminada.
         if self.sucursal_id == sucursal.pk:
             return True
 
@@ -137,15 +249,33 @@ class NumeroCanal(models.Model):
             .exists()
         )
 
+    # =====================================================
+    # GUARDADO
+    # =====================================================
+
     def save(self, *args, **kwargs):
         self.full_clean()
-        super().save(*args, **kwargs)
+
+        super().save(
+            *args,
+            **kwargs,
+        )
+
+    # =====================================================
+    # REPRESENTACIÓN
+    # =====================================================
 
     def __str__(self):
+        principal = (
+            " [PRINCIPAL]"
+            if self.es_principal
+            else ""
+        )
+
         return (
-            f"{self.nombre} "
-            f"({self.numero_telefonico or 'Sin número'}) "
-            f"- {self.tipo}"
+            f"{self.nombre}"
+            f"{principal} "
+            f"({self.numero_telefonico or 'Sin número'})"
         )
 
 
@@ -156,8 +286,14 @@ class NumeroCanal(models.Model):
 
 class Contacto(models.Model):
     """
-    Representa una identidad externa que interactúa
-    con los canales de comunicación.
+    Representa una persona o entidad externa con la que
+    MAO mantiene una comunicación.
+
+    MAO Comunicaciones no necesita saber si el contacto
+    es cliente, proveedor, empleado, prospecto, etc.
+
+    Esa interpretación corresponde al ERP, MAO Citas,
+    MAO Asistente u otros sistemas.
     """
 
     nombre = models.CharField(
@@ -176,12 +312,15 @@ class Contacto(models.Model):
         max_length=50,
         null=True,
         blank=True,
+        db_index=True,
     )
 
-    identificador_externo = models.CharField(
-        max_length=255,
-        null=True,
-        blank=True,
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
     )
 
     class Meta:
@@ -193,7 +332,7 @@ class Contacto(models.Model):
             self.nombre
             or self.nombre_perfil
             or self.numero_telefonico
-            or f"Contacto #{self.id}"
+            or f"Contacto #{self.pk}"
         )
 
 
@@ -203,6 +342,16 @@ class Contacto(models.Model):
 
 
 class IdentidadContactoExterna(models.Model):
+    """
+    Vincula un Contacto con la identidad que utiliza
+    dentro de un proveedor externo.
+
+    Ejemplo:
+
+        proveedor = META
+        identificador_externo = wa_id
+    """
+
     contacto = models.ForeignKey(
         Contacto,
         on_delete=models.CASCADE,
@@ -211,15 +360,21 @@ class IdentidadContactoExterna(models.Model):
 
     proveedor = models.CharField(
         max_length=50,
+        db_index=True,
     )
 
     identificador_externo = models.CharField(
         max_length=255,
+        db_index=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
     )
 
     class Meta:
-        verbose_name = "Identidad Contacto Externa"
-        verbose_name_plural = "Identidades Contactos Externas"
+        verbose_name = "Identidad externa del contacto"
+        verbose_name_plural = "Identidades externas de contactos"
 
         constraints = [
             models.UniqueConstraint(
@@ -227,7 +382,9 @@ class IdentidadContactoExterna(models.Model):
                     "proveedor",
                     "identificador_externo",
                 ],
-                name="unique_identidad_proveedor_externo",
+                name=(
+                    "unique_identidad_proveedor_externo"
+                ),
             )
         ]
 
@@ -245,14 +402,35 @@ class IdentidadContactoExterna(models.Model):
 
 
 class Conversacion(models.Model):
+    """
+    Contenedor lógico de mensajes entre un canal de MAO
+    y un contacto externo.
+
+    Una conversación puede comenzar sin sucursal.
+
+    Ejemplo:
+
+        cliente
+            ↓
+        WhatsApp principal MAO
+            ↓
+        Conversacion.sucursal = NULL
+
+    Posteriormente ERP, MAO Citas, un asesor u otro sistema
+    puede determinar:
+
+        Conversacion.sucursal = referencia ERP de MAO Norte
+
+    MAO Comunicaciones no inventa esa sucursal.
+    """
+
     class TipoConversacion(models.TextChoices):
         INDIVIDUAL = "INDIVIDUAL", "Individual"
         GRUPO = "GRUPO", "Grupo"
 
-    class PrivacidadConversacion(models.TextChoices):
-        EMPRESARIAL = "EMPRESARIAL", "Empresarial"
-        PRIVADA = "PRIVADA", "Privada"
-        SIN_CLASIFICAR = "SIN_CLASIFICAR", "Sin Clasificar"
+    # =====================================================
+    # CANAL
+    # =====================================================
 
     numero_canal = models.ForeignKey(
         NumeroCanal,
@@ -260,11 +438,21 @@ class Conversacion(models.Model):
         related_name="conversaciones",
     )
 
+    # =====================================================
+    # SUCURSAL
+    # =====================================================
+
     sucursal = models.ForeignKey(
         Sucursal,
         on_delete=models.PROTECT,
+        null=True,
+        blank=True,
         related_name="conversaciones",
     )
+
+    # =====================================================
+    # CONTACTO PRINCIPAL
+    # =====================================================
 
     contacto = models.ForeignKey(
         Contacto,
@@ -274,31 +462,20 @@ class Conversacion(models.Model):
         related_name="conversaciones",
     )
 
+    # =====================================================
+    # TIPO
+    # =====================================================
+
     tipo = models.CharField(
         max_length=50,
         choices=TipoConversacion.choices,
         default=TipoConversacion.INDIVIDUAL,
+        db_index=True,
     )
 
-    privacidad = models.CharField(
-        max_length=50,
-        choices=PrivacidadConversacion.choices,
-        default=PrivacidadConversacion.SIN_CLASIFICAR,
-    )
-
-    usuarios_autorizados = models.ManyToManyField(
-        settings.AUTH_USER_MODEL,
-        blank=True,
-        related_name="conversaciones_autorizadas",
-    )
-
-    asignado_a = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="conversaciones_asignadas",
-    )
+    # =====================================================
+    # ESTADO
+    # =====================================================
 
     pendiente = models.BooleanField(
         default=False,
@@ -319,61 +496,87 @@ class Conversacion(models.Model):
         auto_now=True,
     )
 
+    # =====================================================
+    # META
+    # =====================================================
+
     class Meta:
         verbose_name = "Conversación"
         verbose_name_plural = "Conversaciones"
 
-        permissions = [
-            (
-                "cambiar_privacidad_conversacion",
-                "Can change conversation privacy classification",
-            ),
+        ordering = [
+            "-ultimo_mensaje_at",
+            "-created_at",
         ]
 
         constraints = [
+            # Para un mismo canal no necesitamos dos chats
+            # individuales distintos con el mismo contacto.
             models.UniqueConstraint(
                 fields=[
                     "numero_canal",
                     "contacto",
                 ],
-                name="unique_conversacion_individual_por_contacto",
                 condition=models.Q(
                     tipo="INDIVIDUAL",
                     contacto__isnull=False,
                 ),
+                name=(
+                    "unique_conversacion_individual_por_contacto"
+                ),
             )
         ]
+
+    # =====================================================
+    # VALIDACIÓN
+    # =====================================================
 
     def clean(self):
         super().clean()
 
-        if self.numero_canal_id and self.sucursal_id:
+        if (
+            self.sucursal_id
+            and self.numero_canal_id
+        ):
             if not self.numero_canal.permite_sucursal(
                 self.sucursal
             ):
                 raise ValidationError(
                     {
                         "sucursal": (
-                            "La sucursal de la conversación "
-                            "no está habilitada para este canal."
+                            "La sucursal no está habilitada "
+                            "para este canal."
                         )
                     }
                 )
 
+    # =====================================================
+    # GUARDADO
+    # =====================================================
+
     def save(self, *args, **kwargs):
         self.full_clean()
-        super().save(*args, **kwargs)
+
+        super().save(
+            *args,
+            **kwargs,
+        )
+
+    # =====================================================
+    # REPRESENTACIÓN
+    # =====================================================
 
     def __str__(self):
-        if self.tipo == self.TipoConversacion.GRUPO:
-            tipo_label = "Grupo"
-        else:
-            tipo_label = f"Individual con {self.contacto}"
+        contacto = (
+            str(self.contacto)
+            if self.contacto_id
+            else "Sin contacto"
+        )
 
         return (
-            f"Chat #{self.id} "
-            f"[{tipo_label}] "
-            f"- Canal: {self.numero_canal.nombre}"
+            f"Conversación #{self.pk or 'NUEVA'} "
+            f"- {self.numero_canal.nombre} "
+            f"- {contacto}"
         )
 
 
@@ -383,9 +586,17 @@ class Conversacion(models.Model):
 
 
 class Grupo(models.Model):
+    """
+    Extensión opcional de una conversación grupal.
+
+    Actualmente WhatsApp Cloud API puede no utilizar esta
+    funcionalidad, pero el modelo permanece genérico para
+    otros canales futuros.
+    """
+
     conversacion = models.OneToOneField(
         Conversacion,
-        on_delete=models.PROTECT,
+        on_delete=models.CASCADE,
         related_name="grupo",
     )
 
@@ -408,6 +619,10 @@ class Grupo(models.Model):
         default=True,
     )
 
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
     class Meta:
         verbose_name = "Grupo"
         verbose_name_plural = "Grupos"
@@ -423,21 +638,22 @@ class Grupo(models.Model):
             raise ValidationError(
                 {
                     "conversacion": (
-                        "Un grupo solo puede asociarse "
-                        "a una conversación de tipo GRUPO."
+                        "Un Grupo requiere una conversación "
+                        "de tipo GRUPO."
                     )
                 }
             )
 
     def save(self, *args, **kwargs):
         self.full_clean()
-        super().save(*args, **kwargs)
+
+        super().save(
+            *args,
+            **kwargs,
+        )
 
     def __str__(self):
-        return (
-            f"Grupo: {self.nombre} "
-            f"(Chat #{self.conversacion_id})"
-        )
+        return self.nombre
 
 
 # =========================================================
@@ -446,6 +662,10 @@ class Grupo(models.Model):
 
 
 class Participante(models.Model):
+    """
+    Participación de un Contacto dentro de un Grupo.
+    """
+
     grupo = models.ForeignKey(
         Grupo,
         on_delete=models.CASCADE,
@@ -467,8 +687,8 @@ class Participante(models.Model):
     )
 
     class Meta:
-        verbose_name = "Participante de Grupo"
-        verbose_name_plural = "Participantes de Grupos"
+        verbose_name = "Participante"
+        verbose_name_plural = "Participantes"
 
         constraints = [
             models.UniqueConstraint(
@@ -481,16 +701,9 @@ class Participante(models.Model):
         ]
 
     def __str__(self):
-        admin_flag = (
-            " (Admin)"
-            if self.es_administrador
-            else ""
-        )
-
         return (
             f"{self.contacto} "
-            f"en {self.grupo.nombre}"
-            f"{admin_flag}"
+            f"en {self.grupo}"
         )
 
 
@@ -500,6 +713,20 @@ class Participante(models.Model):
 
 
 class Mensaje(models.Model):
+    """
+    Unidad fundamental de MAO Comunicaciones.
+
+    MAO Comunicaciones registra el mensaje y su estado
+    de transporte.
+
+    No interpreta intención, citas, órdenes de trabajo,
+    alertas ni lógica de negocio.
+    """
+
+    # =====================================================
+    # TIPO
+    # =====================================================
+
     class TipoMensaje(models.TextChoices):
         TEXT = "TEXT", "Texto"
         AUDIO = "AUDIO", "Audio"
@@ -512,17 +739,30 @@ class Mensaje(models.Model):
         STICKER = "STICKER", "Sticker"
         UNKNOWN = "UNKNOWN", "Desconocido"
 
+    # =====================================================
+    # DIRECCIÓN
+    # =====================================================
+
     class DireccionMensaje(models.TextChoices):
         ENTRANTE = "ENTRANTE", "Entrante"
         SALIENTE = "SALIENTE", "Saliente"
         SISTEMA = "SISTEMA", "Sistema"
 
+    # =====================================================
+    # ESTADO
+    # =====================================================
+
     class EstadoMensaje(models.TextChoices):
+        PENDIENTE = "PENDIENTE", "Pendiente"
         RECIBIDO = "RECIBIDO", "Recibido"
         ENVIADO = "ENVIADO", "Enviado"
         ENTREGADO = "ENTREGADO", "Entregado"
         LEIDO = "LEIDO", "Leído"
         FALLIDO = "FALLIDO", "Fallido"
+
+    # =====================================================
+    # CONVERSACIÓN
+    # =====================================================
 
     conversacion = models.ForeignKey(
         Conversacion,
@@ -530,11 +770,25 @@ class Mensaje(models.Model):
         related_name="mensajes",
     )
 
+    # =====================================================
+    # ID DEL PROVEEDOR
+    # =====================================================
+    #
+    # Ejemplo Meta:
+    #
+    #     wamid....
+    # =====================================================
+
     external_id = models.CharField(
         max_length=255,
         null=True,
         blank=True,
+        db_index=True,
     )
+
+    # =====================================================
+    # REMITENTE EXTERNO
+    # =====================================================
 
     remitente = models.ForeignKey(
         Contacto,
@@ -544,15 +798,21 @@ class Mensaje(models.Model):
         related_name="mensajes_enviados",
     )
 
+    # =====================================================
+    # MENSAJE
+    # =====================================================
+
     direccion = models.CharField(
         max_length=50,
         choices=DireccionMensaje.choices,
+        db_index=True,
     )
 
     tipo = models.CharField(
         max_length=50,
         choices=TipoMensaje.choices,
         default=TipoMensaje.TEXT,
+        db_index=True,
     )
 
     texto_original = models.TextField(
@@ -560,17 +820,47 @@ class Mensaje(models.Model):
         blank=True,
     )
 
+    # =====================================================
+    # ESTADO DE TRANSPORTE
+    # =====================================================
+
     estado = models.CharField(
         max_length=50,
         choices=EstadoMensaje.choices,
-        default=EstadoMensaje.RECIBIDO,
+        default=EstadoMensaje.PENDIENTE,
+        db_index=True,
     )
 
-    fecha_mensaje = models.DateTimeField()
+    error_codigo = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+    )
+
+    error_detalle = models.TextField(
+        null=True,
+        blank=True,
+    )
+
+    # =====================================================
+    # FECHAS
+    # =====================================================
+
+    fecha_mensaje = models.DateTimeField(
+        db_index=True,
+    )
 
     created_at = models.DateTimeField(
         auto_now_add=True,
     )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
+
+    # =====================================================
+    # RESPUESTA
+    # =====================================================
 
     respuesta_a = models.ForeignKey(
         "self",
@@ -580,12 +870,30 @@ class Mensaje(models.Model):
         related_name="respuestas",
     )
 
+    # =====================================================
+    # METADATOS TÉCNICOS
+    # =====================================================
+    #
+    # Payloads complementarios del proveedor.
+    # No se utiliza para lógica de negocio.
+    # =====================================================
+
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+    )
+
+    # =====================================================
+    # META
+    # =====================================================
+
     class Meta:
-        verbose_name = "Message"
-        verbose_name_plural = "Messages"
+        verbose_name = "Mensaje"
+        verbose_name_plural = "Mensajes"
 
         ordering = [
             "fecha_mensaje",
+            "pk",
         ]
 
         constraints = [
@@ -594,29 +902,28 @@ class Mensaje(models.Model):
                     "conversacion",
                     "external_id",
                 ],
-                name="unique_external_id_per_conversation",
                 condition=models.Q(
-                    external_id__isnull=False
+                    external_id__isnull=False,
+                ),
+                name=(
+                    "unique_external_id_per_conversation"
                 ),
             )
         ]
 
-    def __str__(self):
-        sender_label = (
-            self.remitente.nombre
-            if self.remitente
-            else self.direccion
-        )
+    # =====================================================
+    # REPRESENTACIÓN
+    # =====================================================
 
+    def __str__(self):
         contenido = (
             self.texto_original
             or self.tipo
         )
 
         return (
-            f"[{self.fecha_mensaje.strftime('%Y-%m-%d %H:%M')}] "
-            f"{sender_label}: "
-            f"{contenido[:30]}"
+            f"[{self.direccion}] "
+            f"{contenido[:50]}"
         )
 
 
@@ -626,41 +933,74 @@ class Mensaje(models.Model):
 
 
 class ArchivoMultimedia(models.Model):
+    """
+    Archivo asociado a un mensaje.
+
+    Puede representar:
+
+        - imagen;
+        - audio;
+        - video;
+        - PDF;
+        - documento;
+        - sticker;
+        - etc.
+    """
+
     mensaje = models.ForeignKey(
         Mensaje,
         on_delete=models.CASCADE,
         related_name="archivos_multimedia",
     )
 
+    # Puede estar vacío temporalmente si primero recibimos
+    # el media_id del proveedor y el archivo todavía no
+    # ha sido descargado.
     archivo = models.FileField(
-        upload_to="multimedia/",
+        upload_to="multimedia/%Y/%m/",
+        null=True,
+        blank=True,
     )
 
+    # Ejemplo Meta:
+    #
+    #     media_id
+    #
     identificador_externo = models.CharField(
         max_length=255,
         null=True,
         blank=True,
+        db_index=True,
     )
 
     nombre_original = models.CharField(
         max_length=255,
-    )
-
-    mime_type = models.CharField(
-        max_length=127,
-    )
-
-    size_bytes = models.IntegerField(
         null=True,
         blank=True,
     )
 
+    mime_type = models.CharField(
+        max_length=127,
+        null=True,
+        blank=True,
+    )
+
+    size_bytes = models.BigIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
     class Meta:
-        verbose_name = "Archivo Multimedia"
-        verbose_name_plural = "Archivos Multimedia"
+        verbose_name = "Archivo multimedia"
+        verbose_name_plural = "Archivos multimedia"
 
     def __str__(self):
         return (
-            f"{self.nombre_original} "
-            f"({self.mime_type})"
+            self.nombre_original
+            or self.identificador_externo
+            or f"Archivo #{self.pk}"
         )

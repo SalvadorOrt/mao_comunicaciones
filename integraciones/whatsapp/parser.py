@@ -1,12 +1,17 @@
+# integraciones/whatsapp/parser.py
+
 import logging
-from datetime import datetime, timezone as datetime_timezone
+from datetime import (
+    datetime,
+    timezone as datetime_timezone,
+)
 
 from django.utils import timezone
 
 from comunicaciones.models import Mensaje
 
 
-logger = logging.getLogger("django")
+logger = logging.getLogger(__name__)
 
 
 # ==========================================================
@@ -14,135 +19,461 @@ logger = logging.getLogger("django")
 # ==========================================================
 
 
-def parse_whatsapp_payload(payload: dict) -> list:
+def parse_whatsapp_payload(
+    payload: dict,
+) -> list:
     """
-    Parsea de forma segura un payload de WhatsApp Cloud API.
-
-    Convierte la estructura externa de Meta en eventos
-    normalizados utilizados internamente por
+    Convierte el payload externo de WhatsApp Cloud API
+    en eventos normalizados utilizados internamente por
     MAO Comunicaciones.
 
-    El JSON recibido se trata exclusivamente como datos.
+    Este parser:
+
+        - NO guarda nada en base de datos;
+        - NO llama al ERP;
+        - NO agenda citas;
+        - NO utiliza IA;
+        - NO aplica lógica de negocio.
+
+    Únicamente transforma datos de Meta a un contrato
+    interno estable.
     """
 
     eventos = []
 
-    try:
-        if payload.get("object") != "whatsapp_business_account":
-            logger.warning(
-                "Payload ignorado porque no corresponde a "
-                "'whatsapp_business_account'."
+    # ======================================================
+    # VALIDACIÓN BÁSICA
+    # ======================================================
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        return eventos
+
+    if (
+        payload.get("object")
+        != "whatsapp_business_account"
+    ):
+
+        logger.debug(
+            (
+                "Payload ignorado porque no corresponde "
+                "a whatsapp_business_account."
             )
-            return eventos
-
-        for entry in payload.get("entry", []):
-            for change in entry.get("changes", []):
-
-                value = change.get("value", {})
-
-                # ==========================================
-                # CANAL RECEPTOR
-                # ==========================================
-
-                phone_number_id = (
-                    value.get("metadata", {})
-                    .get("phone_number_id")
-                )
-
-                if not phone_number_id:
-                    continue
-
-                # ==========================================
-                # MENSAJES ENTRANTES
-                # ==========================================
-
-                for message in value.get("messages", []):
-
-                    wa_id = message.get("from")
-
-                    evento = {
-                        "tipo_evento":
-                            "message",
-
-                        "phone_number_id":
-                            phone_number_id,
-
-                        "wa_id":
-                            wa_id,
-
-                        "external_id":
-                            message.get("id"),
-
-                        "timestamp":
-                            _parse_timestamp(
-                                message.get("timestamp")
-                            ),
-
-                        "nombre_perfil":
-                            _extract_profile_name(
-                                value.get("contacts", []),
-                                wa_id,
-                            ),
-
-                        "direccion":
-                            Mensaje.DireccionMensaje.ENTRANTE,
-
-                        "tipo":
-                            _map_message_type(
-                                message.get("type")
-                            ),
-
-                        "texto_original":
-                            _extract_text(message),
-
-                        "respuesta_a_external_id":
-                            _extract_reply_to(message),
-
-                        "media_id":
-                            _extract_media_id(message),
-                    }
-
-                    eventos.append(evento)
-
-                # ==========================================
-                # ESTADOS DE MENSAJES
-                # ==========================================
-
-                for status in value.get("statuses", []):
-
-                    evento = {
-                        "tipo_evento":
-                            "status",
-
-                        "phone_number_id":
-                            phone_number_id,
-
-                        "wa_id":
-                            status.get("recipient_id"),
-
-                        "external_id":
-                            status.get("id"),
-
-                        "timestamp":
-                            _parse_timestamp(
-                                status.get("timestamp")
-                            ),
-
-                        "estado":
-                            _map_status_type(
-                                status.get("status")
-                            ),
-                    }
-
-                    eventos.append(evento)
-
-    except Exception:
-        logger.exception(
-            "Error inesperado parseando payload "
-            "de WhatsApp."
         )
 
+        return eventos
+
+    # ======================================================
+    # ENTRIES
+    # ======================================================
+
+    entries = payload.get(
+        "entry",
+        [],
+    )
+
+    if not isinstance(
+        entries,
+        list,
+    ):
+        return eventos
+
+    for entry in entries:
+
+        if not isinstance(
+            entry,
+            dict,
+        ):
+            continue
+
+        changes = entry.get(
+            "changes",
+            [],
+        )
+
+        if not isinstance(
+            changes,
+            list,
+        ):
+            continue
+
+        for change in changes:
+
+            if not isinstance(
+                change,
+                dict,
+            ):
+                continue
+
+            value = change.get(
+                "value",
+                {},
+            )
+
+            if not isinstance(
+                value,
+                dict,
+            ):
+                continue
+
+            # =================================================
+            # METADATA DEL NÚMERO RECEPTOR
+            # =================================================
+
+            metadata_meta = value.get(
+                "metadata",
+                {},
+            )
+
+            if not isinstance(
+                metadata_meta,
+                dict,
+            ):
+                metadata_meta = {}
+
+            phone_number_id = str(
+                metadata_meta.get(
+                    "phone_number_id"
+                )
+                or ""
+            ).strip()
+
+            display_phone_number = str(
+                metadata_meta.get(
+                    "display_phone_number"
+                )
+                or ""
+            ).strip()
+
+            # Sin phone_number_id no podemos saber
+            # qué NumeroCanal recibió el evento.
+            if not phone_number_id:
+                continue
+
+            # =================================================
+            # MENSAJES ENTRANTES
+            # =================================================
+
+            messages = value.get(
+                "messages",
+                [],
+            )
+
+            if isinstance(
+                messages,
+                list,
+            ):
+
+                for message in messages:
+
+                    if not isinstance(
+                        message,
+                        dict,
+                    ):
+                        continue
+
+                    evento = (
+                        _parse_message_event(
+                            message=message,
+                            value=value,
+                            phone_number_id=(
+                                phone_number_id
+                            ),
+                            display_phone_number=(
+                                display_phone_number
+                            ),
+                        )
+                    )
+
+                    if evento:
+                        eventos.append(
+                            evento
+                        )
+
+            # =================================================
+            # ESTADOS DE MENSAJES SALIENTES
+            # =================================================
+
+            statuses = value.get(
+                "statuses",
+                [],
+            )
+
+            if isinstance(
+                statuses,
+                list,
+            ):
+
+                for status in statuses:
+
+                    if not isinstance(
+                        status,
+                        dict,
+                    ):
+                        continue
+
+                    evento = (
+                        _parse_status_event(
+                            status=status,
+                            phone_number_id=(
+                                phone_number_id
+                            ),
+                            display_phone_number=(
+                                display_phone_number
+                            ),
+                        )
+                    )
+
+                    if evento:
+                        eventos.append(
+                            evento
+                        )
+
     return eventos
+
+
+# ==========================================================
+# MENSAJE ENTRANTE
+# ==========================================================
+
+
+def _parse_message_event(
+    *,
+    message: dict,
+    value: dict,
+    phone_number_id: str,
+    display_phone_number: str,
+):
+    """
+    Normaliza un mensaje entrante.
+    """
+
+    wa_id = str(
+        message.get(
+            "from"
+        )
+        or ""
+    ).strip()
+
+    external_id = str(
+        message.get(
+            "id"
+        )
+        or ""
+    ).strip()
+
+    meta_type = str(
+        message.get(
+            "type"
+        )
+        or ""
+    ).strip().lower()
+
+    if not wa_id:
+        return None
+
+    # ======================================================
+    # CONTACTO
+    # ======================================================
+
+    contacts = value.get(
+        "contacts",
+        [],
+    )
+
+    if not isinstance(
+        contacts,
+        list,
+    ):
+        contacts = []
+
+    nombre_perfil = (
+        _extract_profile_name(
+            contacts_array=contacts,
+            wa_id=wa_id,
+        )
+    )
+
+    # ======================================================
+    # EVENTO NORMALIZADO
+    # ======================================================
+
+    return {
+        "tipo_evento":
+            "message",
+
+        "phone_number_id":
+            phone_number_id,
+
+        "display_phone_number":
+            display_phone_number,
+
+        "wa_id":
+            wa_id,
+
+        "external_id":
+            (
+                external_id
+                or None
+            ),
+
+        "timestamp":
+            _parse_timestamp(
+                message.get(
+                    "timestamp"
+                )
+            ),
+
+        "nombre_perfil":
+            nombre_perfil,
+
+        "direccion":
+            (
+                Mensaje
+                .DireccionMensaje
+                .ENTRANTE
+            ),
+
+        "tipo":
+            _map_message_type(
+                meta_type
+            ),
+
+        "texto_original":
+            _extract_text(
+                message
+            ),
+
+        "respuesta_a_external_id":
+            _extract_reply_to(
+                message
+            ),
+
+        "media_id":
+            _extract_media_id(
+                message
+            ),
+
+        "mime_type":
+            _extract_mime_type(
+                message
+            ),
+
+        "nombre_archivo":
+            _extract_filename(
+                message
+            ),
+
+        "metadata":
+            _extract_message_metadata(
+                message=message,
+                meta_type=meta_type,
+                display_phone_number=(
+                    display_phone_number
+                ),
+            ),
+    }
+
+
+# ==========================================================
+# STATUS
+# ==========================================================
+
+
+def _parse_status_event(
+    *,
+    status: dict,
+    phone_number_id: str,
+    display_phone_number: str,
+):
+    """
+    Normaliza un estado de entrega recibido desde Meta.
+    """
+
+    external_id = str(
+        status.get(
+            "id"
+        )
+        or ""
+    ).strip()
+
+    meta_status = str(
+        status.get(
+            "status"
+        )
+        or ""
+    ).strip().lower()
+
+    estado = _map_status_type(
+        meta_status
+    )
+
+    # Estado desconocido:
+    # conservamos el comportamiento seguro y lo ignoramos.
+    if estado is None:
+        return None
+
+    (
+        error_codigo,
+        error_detalle,
+    ) = _extract_status_error(
+        status
+    )
+
+    return {
+        "tipo_evento":
+            "status",
+
+        "phone_number_id":
+            phone_number_id,
+
+        "display_phone_number":
+            display_phone_number,
+
+        "wa_id":
+            (
+                str(
+                    status.get(
+                        "recipient_id"
+                    )
+                    or ""
+                ).strip()
+                or None
+            ),
+
+        "external_id":
+            (
+                external_id
+                or None
+            ),
+
+        "timestamp":
+            _parse_timestamp(
+                status.get(
+                    "timestamp"
+                )
+            ),
+
+        "estado":
+            estado,
+
+        "error_codigo":
+            error_codigo,
+
+        "error_detalle":
+            error_detalle,
+
+        "metadata":
+            _extract_status_metadata(
+                status=status,
+                meta_status=meta_status,
+                display_phone_number=(
+                    display_phone_number
+                ),
+            ),
+    }
 
 
 # ==========================================================
@@ -150,22 +481,40 @@ def parse_whatsapp_payload(payload: dict) -> list:
 # ==========================================================
 
 
-def _parse_timestamp(ts_string: str):
+def _parse_timestamp(
+    ts_string,
+):
     """
-    Convierte un timestamp UNIX enviado por Meta
-    a datetime timezone-aware.
+    Convierte el timestamp UNIX enviado por Meta en
+    datetime timezone-aware.
+
+    Si no puede interpretarse, utiliza la hora actual.
     """
 
-    if not ts_string:
+    if ts_string in (
+        None,
+        "",
+    ):
         return timezone.now()
 
     try:
+
         return datetime.fromtimestamp(
             int(ts_string),
             tz=datetime_timezone.utc,
         )
 
-    except (ValueError, TypeError):
+    except (
+        ValueError,
+        TypeError,
+        OverflowError,
+        OSError,
+    ):
+
+        logger.warning(
+            "Timestamp inválido recibido desde Meta."
+        )
+
         return timezone.now()
 
 
@@ -179,16 +528,45 @@ def _extract_profile_name(
     wa_id: str,
 ) -> str:
     """
-    Obtiene el nombre de perfil asociado al wa_id.
+    Obtiene el nombre de perfil que Meta asocia
+    al contacto.
     """
 
     for contact in contacts_array:
 
-        if contact.get("wa_id") == wa_id:
-            return (
-                contact.get("profile", {})
-                .get("name", "")
+        if not isinstance(
+            contact,
+            dict,
+        ):
+            continue
+
+        contact_wa_id = str(
+            contact.get(
+                "wa_id"
             )
+            or ""
+        ).strip()
+
+        if contact_wa_id != wa_id:
+            continue
+
+        profile = contact.get(
+            "profile",
+            {},
+        )
+
+        if not isinstance(
+            profile,
+            dict,
+        ):
+            return ""
+
+        return str(
+            profile.get(
+                "name"
+            )
+            or ""
+        ).strip()
 
     return ""
 
@@ -198,16 +576,18 @@ def _extract_profile_name(
 # ==========================================================
 
 
-def _map_message_type(meta_type: str) -> str:
+def _map_message_type(
+    meta_type: str,
+) -> str:
     """
-    Mapea tipos de Meta al dominio interno.
+    Convierte el tipo técnico de Meta al tipo interno
+    de MAO Comunicaciones.
     """
 
     tipos_soportados = {
         "text":
             Mensaje.TipoMensaje.TEXT,
 
-        # Estos dos contienen interacción textual.
         "button":
             Mensaje.TipoMensaje.TEXT,
 
@@ -250,9 +630,12 @@ def _map_message_type(meta_type: str) -> str:
 # ==========================================================
 
 
-def _map_status_type(meta_status: str):
+def _map_status_type(
+    meta_status: str,
+):
     """
-    Mapea estados de entrega de Meta.
+    Convierte los estados técnicos de Meta al dominio
+    de transporte de MAO Comunicaciones.
     """
 
     estados_soportados = {
@@ -279,24 +662,75 @@ def _map_status_type(meta_status: str):
 # ==========================================================
 
 
-def _extract_text(message: dict) -> str:
+def _extract_text(
+    message: dict,
+) -> str:
     """
-    Extrae contenido textual según el tipo de mensaje.
+    Extrae la representación textual principal del mensaje.
+
+    La información estructurada adicional permanece en
+    metadata para que otros sistemas puedan utilizarla
+    posteriormente.
     """
 
-    m_type = message.get("type")
+    m_type = str(
+        message.get(
+            "type"
+        )
+        or ""
+    ).strip().lower()
+
+    # ======================================================
+    # TEXTO
+    # ======================================================
 
     if m_type == "text":
-        return (
-            message.get("text", {})
-            .get("body", "")
+
+        data = message.get(
+            "text",
+            {},
         )
 
-    if m_type == "button":
-        return (
-            message.get("button", {})
-            .get("text", "")
+        if not isinstance(
+            data,
+            dict,
+        ):
+            return ""
+
+        return str(
+            data.get(
+                "body"
+            )
+            or ""
         )
+
+    # ======================================================
+    # BOTÓN LEGACY
+    # ======================================================
+
+    if m_type == "button":
+
+        data = message.get(
+            "button",
+            {},
+        )
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            return ""
+
+        return str(
+            data.get(
+                "text"
+            )
+            or ""
+        )
+
+    # ======================================================
+    # INTERACTIVE
+    # ======================================================
 
     if m_type == "interactive":
 
@@ -305,53 +739,128 @@ def _extract_text(message: dict) -> str:
             {},
         )
 
-        # Respuesta a botón
-        button_reply = (
-            interactive
-            .get("button_reply", {})
-            .get("title")
+        if not isinstance(
+            interactive,
+            dict,
+        ):
+            return ""
+
+        button_reply = interactive.get(
+            "button_reply",
+            {},
         )
 
-        if button_reply:
-            return button_reply
+        if isinstance(
+            button_reply,
+            dict,
+        ):
 
-        # Respuesta a lista
-        list_reply = (
-            interactive
-            .get("list_reply", {})
-            .get("title")
+            title = button_reply.get(
+                "title"
+            )
+
+            if title:
+                return str(
+                    title
+                )
+
+        list_reply = interactive.get(
+            "list_reply",
+            {},
         )
 
-        return list_reply or ""
+        if isinstance(
+            list_reply,
+            dict,
+        ):
 
-    if m_type in [
+            title = list_reply.get(
+                "title"
+            )
+
+            if title:
+                return str(
+                    title
+                )
+
+        return ""
+
+    # ======================================================
+    # CAPTION DE MULTIMEDIA
+    # ======================================================
+
+    if m_type in (
         "image",
         "video",
         "document",
-    ]:
-        return (
-            message.get(m_type, {})
-            .get("caption", "")
+    ):
+
+        media = message.get(
+            m_type,
+            {},
         )
 
+        if not isinstance(
+            media,
+            dict,
+        ):
+            return ""
+
+        return str(
+            media.get(
+                "caption"
+            )
+            or ""
+        )
+
+    # ======================================================
+    # REACCIÓN
+    # ======================================================
+
+    if m_type == "reaction":
+
+        reaction = message.get(
+            "reaction",
+            {},
+        )
+
+        if not isinstance(
+            reaction,
+            dict,
+        ):
+            return ""
+
+        return str(
+            reaction.get(
+                "emoji"
+            )
+            or ""
+        )
+
+    # ======================================================
+    # DESCONOCIDO
+    # ======================================================
+
     if m_type == "unknown":
+
         return (
-            "Formato de mensaje de Meta "
-            "no soportado."
+            "Formato de mensaje de Meta no soportado."
         )
 
     return ""
 
 
 # ==========================================================
-# RESPUESTAS
+# RESPUESTA / CONTEXTO
 # ==========================================================
 
 
-def _extract_reply_to(message: dict):
+def _extract_reply_to(
+    message: dict,
+):
     """
-    Obtiene el external_id del mensaje original
-    cuando el mensaje actual es una respuesta.
+    Obtiene el wamid del mensaje original cuando el
+    mensaje actual es una respuesta.
     """
 
     context = message.get(
@@ -359,32 +868,478 @@ def _extract_reply_to(message: dict):
         {},
     )
 
-    return context.get("id")
+    if not isinstance(
+        context,
+        dict,
+    ):
+        return None
+
+    external_id = str(
+        context.get(
+            "id"
+        )
+        or ""
+    ).strip()
+
+    return (
+        external_id
+        or None
+    )
 
 
 # ==========================================================
-# MULTIMEDIA
+# MEDIA ID
 # ==========================================================
 
 
-def _extract_media_id(message: dict):
+def _extract_media_id(
+    message: dict,
+):
     """
-    Obtiene el media_id de Meta cuando el evento
-    contiene un archivo multimedia.
+    Extrae el media_id de mensajes que contienen
+    multimedia.
     """
 
-    m_type = message.get("type")
+    m_type = str(
+        message.get(
+            "type"
+        )
+        or ""
+    ).strip().lower()
 
-    if m_type in [
+    if m_type not in (
         "audio",
         "image",
         "video",
         "document",
         "sticker",
-    ]:
+    ):
+        return None
+
+    media = message.get(
+        m_type,
+        {},
+    )
+
+    if not isinstance(
+        media,
+        dict,
+    ):
+        return None
+
+    media_id = str(
+        media.get(
+            "id"
+        )
+        or ""
+    ).strip()
+
+    return (
+        media_id
+        or None
+    )
+
+
+# ==========================================================
+# MIME TYPE
+# ==========================================================
+
+
+def _extract_mime_type(
+    message: dict,
+):
+    """
+    Extrae el MIME type que Meta incluye en mensajes
+    multimedia.
+    """
+
+    m_type = str(
+        message.get(
+            "type"
+        )
+        or ""
+    ).strip().lower()
+
+    if m_type not in (
+        "audio",
+        "image",
+        "video",
+        "document",
+        "sticker",
+    ):
+        return None
+
+    media = message.get(
+        m_type,
+        {},
+    )
+
+    if not isinstance(
+        media,
+        dict,
+    ):
+        return None
+
+    mime_type = str(
+        media.get(
+            "mime_type"
+        )
+        or ""
+    ).strip()
+
+    return (
+        mime_type
+        or None
+    )
+
+
+# ==========================================================
+# NOMBRE DEL ARCHIVO
+# ==========================================================
+
+
+def _extract_filename(
+    message: dict,
+):
+    """
+    Extrae el nombre original cuando Meta lo proporciona.
+
+    Normalmente aplica principalmente a documentos.
+    """
+
+    m_type = str(
+        message.get(
+            "type"
+        )
+        or ""
+    ).strip().lower()
+
+    if m_type != "document":
+        return None
+
+    document = message.get(
+        "document",
+        {},
+    )
+
+    if not isinstance(
+        document,
+        dict,
+    ):
+        return None
+
+    filename = str(
+        document.get(
+            "filename"
+        )
+        or ""
+    ).strip()
+
+    return (
+        filename
+        or None
+    )
+
+
+# ==========================================================
+# ERROR DE STATUS
+# ==========================================================
+
+
+def _extract_status_error(
+    status: dict,
+):
+    """
+    Extrae el primer error técnico reportado por Meta
+    para un estado FALLIDO.
+
+    Retorna:
+
+        (
+            error_codigo,
+            error_detalle,
+        )
+    """
+
+    errors = status.get(
+        "errors",
+        [],
+    )
+
+    if not isinstance(
+        errors,
+        list,
+    ) or not errors:
+
         return (
-            message.get(m_type, {})
-            .get("id")
+            None,
+            None,
         )
 
-    return None
+    error = errors[0]
+
+    if not isinstance(
+        error,
+        dict,
+    ):
+
+        return (
+            None,
+            str(error),
+        )
+
+    codigo = (
+        error.get(
+            "code"
+        )
+        or error.get(
+            "error_subcode"
+        )
+    )
+
+    detalle = (
+        error.get(
+            "message"
+        )
+        or error.get(
+            "title"
+        )
+    )
+
+    # Algunos errores de Meta contienen más información
+    # en error_data.details.
+    error_data = error.get(
+        "error_data",
+        {},
+    )
+
+    if isinstance(
+        error_data,
+        dict,
+    ):
+
+        details = error_data.get(
+            "details"
+        )
+
+        if details:
+            detalle = (
+                str(details)
+                if not detalle
+                else f"{detalle}: {details}"
+            )
+
+    return (
+        (
+            str(codigo)
+            if codigo is not None
+            else None
+        ),
+        (
+            str(detalle)
+            if detalle
+            else None
+        ),
+    )
+
+
+# ==========================================================
+# METADATA DEL MENSAJE
+# ==========================================================
+
+
+def _extract_message_metadata(
+    *,
+    message: dict,
+    meta_type: str,
+    display_phone_number: str,
+):
+    """
+    Conserva datos técnicos que pueden ser importantes
+    posteriormente para MAO Citas, MAO Asistente u otros
+    consumidores.
+
+    MAO Comunicaciones los almacena, pero no interpreta
+    su significado empresarial.
+    """
+
+    metadata = {
+        "meta_type":
+            meta_type,
+    }
+
+    if display_phone_number:
+
+        metadata[
+            "display_phone_number"
+        ] = display_phone_number
+
+    # ======================================================
+    # CONTEXTO
+    # ======================================================
+
+    context = message.get(
+        "context"
+    )
+
+    if isinstance(
+        context,
+        dict,
+    ):
+
+        metadata[
+            "context"
+        ] = context
+
+    # ======================================================
+    # UBICACIÓN
+    # ======================================================
+
+    if meta_type == "location":
+
+        location = message.get(
+            "location"
+        )
+
+        if isinstance(
+            location,
+            dict,
+        ):
+
+            metadata[
+                "location"
+            ] = location
+
+    # ======================================================
+    # CONTACTOS
+    # ======================================================
+
+    if meta_type == "contacts":
+
+        contacts = message.get(
+            "contacts"
+        )
+
+        if isinstance(
+            contacts,
+            list,
+        ):
+
+            metadata[
+                "contacts"
+            ] = contacts
+
+    # ======================================================
+    # INTERACTIVE
+    # ======================================================
+
+    if meta_type == "interactive":
+
+        interactive = message.get(
+            "interactive"
+        )
+
+        if isinstance(
+            interactive,
+            dict,
+        ):
+
+            metadata[
+                "interactive"
+            ] = interactive
+
+    # ======================================================
+    # BOTÓN
+    # ======================================================
+
+    if meta_type == "button":
+
+        button = message.get(
+            "button"
+        )
+
+        if isinstance(
+            button,
+            dict,
+        ):
+
+            metadata[
+                "button"
+            ] = button
+
+    # ======================================================
+    # REACCIÓN
+    # ======================================================
+
+    if meta_type == "reaction":
+
+        reaction = message.get(
+            "reaction"
+        )
+
+        if isinstance(
+            reaction,
+            dict,
+        ):
+
+            metadata[
+                "reaction"
+            ] = reaction
+
+    return metadata
+
+
+# ==========================================================
+# METADATA DEL STATUS
+# ==========================================================
+
+
+def _extract_status_metadata(
+    *,
+    status: dict,
+    meta_status: str,
+    display_phone_number: str,
+):
+    """
+    Conserva información técnica adicional de estados
+    enviados por Meta.
+    """
+
+    metadata = {
+        "meta_status":
+            meta_status,
+    }
+
+    if display_phone_number:
+
+        metadata[
+            "display_phone_number"
+        ] = display_phone_number
+
+    conversation = status.get(
+        "conversation"
+    )
+
+    if isinstance(
+        conversation,
+        dict,
+    ):
+
+        metadata[
+            "conversation"
+        ] = conversation
+
+    pricing = status.get(
+        "pricing"
+    )
+
+    if isinstance(
+        pricing,
+        dict,
+    ):
+
+        metadata[
+            "pricing"
+        ] = pricing
+
+    return metadata

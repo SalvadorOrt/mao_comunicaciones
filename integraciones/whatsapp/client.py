@@ -1,157 +1,322 @@
 # integraciones/whatsapp/client.py
 
 import logging
+from typing import Optional
 
 import requests
 from django.conf import settings
 
 
-logger = logging.getLogger("django")
+logger = logging.getLogger(__name__)
 
 
 # ==========================================================
 # META GRAPH API
 # ==========================================================
 
-GRAPH_API_BASE_URL = "https://graph.facebook.com/"
+GRAPH_API_BASE_URL = "https://graph.facebook.com"
+
+
+# ==========================================================
+# EXCEPCIONES INTERNAS
+# ==========================================================
+
+
+class MetaClientError(Exception):
+    """
+    Excepción base del cliente técnico de Meta.
+    """
+
+    pass
+
+
+class MetaClientNoConfigurado(MetaClientError):
+    """
+    Falta configuración necesaria para utilizar Meta.
+    """
+
+    pass
 
 
 # ==========================================================
 # CONFIGURACIÓN
 # ==========================================================
 
+
 def get_meta_api_version() -> str:
     """
-    Obtiene la versión de Meta Graph API configurada.
+    Obtiene la versión de Graph API configurada.
 
-    Si no existe META_API_VERSION en settings,
-    utiliza v20.0 como valor por defecto.
+    La versión debe configurarse externamente para evitar
+    que MAO Comunicaciones dependa de una versión fija
+    escrita en código.
     """
 
-    return getattr(
-        settings,
-        "META_API_VERSION",
-        "v20.0",
-    )
+    version = str(
+        getattr(
+            settings,
+            "META_API_VERSION",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not version:
+        raise MetaClientNoConfigurado(
+            "META_API_VERSION no está configurado."
+        )
+
+    if not version.startswith("v"):
+        version = f"v{version}"
+
+    return version
 
 
 def get_global_access_token() -> str:
     """
-    Obtiene el token global utilizado para comunicarse
-    con Meta WhatsApp Cloud API.
+    Obtiene el token técnico utilizado por MAO Comunicaciones
+    para comunicarse con WhatsApp Cloud API.
+
+    Ningún ERP, MAO Citas ni MAO Asistente necesita conocer
+    este token.
     """
 
-    return getattr(
-        settings,
-        "META_ACCESS_TOKEN",
-        None,
-    )
+    token = str(
+        getattr(
+            settings,
+            "META_ACCESS_TOKEN",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not token:
+        raise MetaClientNoConfigurado(
+            "META_ACCESS_TOKEN no está configurado."
+        )
+
+    return token
 
 
-def _build_url(endpoint: str) -> str:
+def _resolver_token(
+    access_token: Optional[str] = None,
+) -> str:
     """
-    Construye una URL completa de Meta Graph API.
+    Permite inyectar un token explícito en tests y,
+    normalmente, utiliza la configuración global.
+    """
+
+    token = str(
+        access_token or ""
+    ).strip()
+
+    if token:
+        return token
+
+    return get_global_access_token()
+
+
+def _build_url(
+    endpoint: str,
+) -> str:
+    """
+    Construye una URL de Graph API.
     """
 
     version = get_meta_api_version()
 
-    clean_endpoint = endpoint.lstrip("/")
+    endpoint = str(
+        endpoint or ""
+    ).strip().lstrip("/")
+
+    if not endpoint:
+        raise ValueError(
+            "Se requiere un endpoint de Meta."
+        )
 
     return (
-        f"{GRAPH_API_BASE_URL}"
+        f"{GRAPH_API_BASE_URL}/"
         f"{version}/"
-        f"{clean_endpoint}"
+        f"{endpoint}"
     )
 
 
 # ==========================================================
-# UTILIDADES INTERNAS
+# RESPUESTAS
 # ==========================================================
 
-def _obtener_wamid(data: dict):
+
+def _respuesta_error(
+    *,
+    tipo: str,
+    detalle: Optional[str] = None,
+    status_code: Optional[int] = None,
+    codigo=None,
+    raw_response=None,
+) -> dict:
     """
-    Extrae el identificador del mensaje generado por Meta.
+    Contrato uniforme de error utilizado por el cliente.
 
-    Ejemplo:
-
-        wamid.HBgM...
+    Nunca incluye access tokens.
     """
 
-    if not isinstance(data, dict):
+    error = {
+        "type": tipo,
+    }
+
+    if detalle:
+        error["message"] = str(
+            detalle
+        )
+
+    if status_code is not None:
+        error["status_code"] = (
+            status_code
+        )
+
+    if codigo is not None:
+        error["code"] = codigo
+
+    return {
+        "success": False,
+        "error": error,
+        "raw_response": raw_response,
+    }
+
+
+def _extraer_error_meta(
+    response: requests.Response,
+):
+    """
+    Extrae información útil de un error HTTP de Meta
+    sin depender de que siempre exista JSON válido.
+    """
+
+    raw = None
+    codigo = None
+    detalle = None
+
+    try:
+
+        raw = response.json()
+
+        if isinstance(raw, dict):
+
+            error = raw.get(
+                "error"
+            )
+
+            if isinstance(error, dict):
+
+                codigo = (
+                    error.get("code")
+                    or error.get(
+                        "error_subcode"
+                    )
+                )
+
+                detalle = (
+                    error.get("message")
+                    or error.get(
+                        "error_user_msg"
+                    )
+                )
+
+    except ValueError:
+        raw = None
+
+    if not detalle:
+
+        try:
+            detalle = (
+                response.text
+                or "Meta devolvió un error HTTP."
+            )
+
+        except Exception:
+            detalle = (
+                "Meta devolvió un error HTTP."
+            )
+
+    return (
+        codigo,
+        detalle,
+        raw,
+    )
+
+
+def _obtener_wamid(
+    data: dict,
+):
+    """
+    Extrae el identificador wamid devuelto por Meta.
+    """
+
+    if not isinstance(
+        data,
+        dict,
+    ):
         return None
 
     messages = data.get(
-        "messages",
-        [],
+        "messages"
     )
 
-    if not messages:
+    if (
+        not isinstance(
+            messages,
+            list,
+        )
+        or not messages
+    ):
         return None
 
-    return messages[0].get("id")
+    primer_mensaje = messages[0]
+
+    if not isinstance(
+        primer_mensaje,
+        dict,
+    ):
+        return None
+
+    return primer_mensaje.get(
+        "id"
+    )
 
 
 # ==========================================================
-# ENVIAR MENSAJE DE TEXTO
+# REQUEST JSON
 # ==========================================================
 
-def enviar_mensaje_texto_meta(
-    phone_number_id: str,
-    wa_id: str,
-    text: str,
-    access_token: str = None,
+
+def _post_json(
+    *,
+    url: str,
+    payload: dict,
+    access_token: Optional[str] = None,
+    timeout=(3.0, 10.0),
 ) -> dict:
     """
-    Envía un mensaje de texto utilizando WhatsApp Cloud API.
+    Ejecuta una solicitud POST JSON contra Meta.
 
-    phone_number_id:
-        Número emisor configurado en Meta para MAO.
-
-    wa_id:
-        Número destinatario.
-
-        Ejemplo Ecuador:
-            593991234567
-
-        Este número vendrá del ERP.
-
-    text:
-        Texto que se enviará al cliente.
+    Es una utilidad de transporte puro.
     """
 
-    token = (
-        access_token
-        or get_global_access_token()
-    )
-
-    if not token:
-        logger.error(
-            "No se ha configurado un META_ACCESS_TOKEN. "
-            "Envío abortado."
+    try:
+        token = _resolver_token(
+            access_token
         )
 
-        return {
-            "error": "Missing access token",
-        }
+    except MetaClientNoConfigurado as exc:
 
-    if not phone_number_id:
-        return {
-            "error": "Missing phone_number_id",
-        }
+        logger.error(
+            "Meta no está configurado correctamente."
+        )
 
-    if not wa_id:
-        return {
-            "error": "Missing wa_id",
-        }
-
-    if not text:
-        return {
-            "error": "Missing text",
-        }
-
-    url = _build_url(
-        f"{phone_number_id}/messages"
-    )
+        return _respuesta_error(
+            tipo="configuration_error",
+            detalle=str(exc),
+        )
 
     headers = {
         "Authorization":
@@ -159,7 +324,195 @@ def enviar_mensaje_texto_meta(
 
         "Content-Type":
             "application/json",
+
+        "Accept":
+            "application/json",
     }
+
+    try:
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+
+    except requests.Timeout:
+
+        logger.warning(
+            "Timeout comunicándose con Meta."
+        )
+
+        return _respuesta_error(
+            tipo="timeout",
+            detalle=(
+                "Meta tardó demasiado en responder."
+            ),
+        )
+
+    except requests.RequestException:
+
+        logger.exception(
+            "Error de red comunicándose con Meta."
+        )
+
+        return _respuesta_error(
+            tipo="network_error",
+            detalle=(
+                "No fue posible comunicarse con Meta."
+            ),
+        )
+
+    # ======================================================
+    # ERROR HTTP
+    # ======================================================
+
+    if not response.ok:
+
+        (
+            codigo,
+            detalle,
+            raw,
+        ) = _extraer_error_meta(
+            response
+        )
+
+        logger.warning(
+            "Meta respondió HTTP %s.",
+            response.status_code,
+        )
+
+        return _respuesta_error(
+            tipo="http_error",
+            detalle=detalle,
+            status_code=response.status_code,
+            codigo=codigo,
+            raw_response=raw,
+        )
+
+    # ======================================================
+    # JSON
+    # ======================================================
+
+    try:
+        data = response.json()
+
+    except ValueError:
+
+        logger.error(
+            "Meta respondió correctamente pero "
+            "el cuerpo no contiene JSON válido."
+        )
+
+        return _respuesta_error(
+            tipo="invalid_json",
+            detalle=(
+                "Meta devolvió una respuesta "
+                "JSON inválida."
+            ),
+            status_code=response.status_code,
+        )
+
+    return {
+        "success": True,
+        "raw_response": data,
+    }
+
+
+# ==========================================================
+# ENVIAR MENSAJE GENÉRICO
+# ==========================================================
+
+
+def enviar_payload_mensaje_meta(
+    *,
+    phone_number_id: str,
+    wa_id: str,
+    tipo: str,
+    contenido: dict,
+    access_token: Optional[str] = None,
+) -> dict:
+    """
+    Envía un payload de mensaje mediante WhatsApp Cloud API.
+
+    Esta función constituye el transporte genérico para:
+
+        TEXT
+        DOCUMENT
+        IMAGE
+        VIDEO
+        AUDIO
+        etc.
+
+    No contiene ninguna lógica de ERP, citas o IA.
+    """
+
+    phone_number_id = str(
+        phone_number_id or ""
+    ).strip()
+
+    wa_id = str(
+        wa_id or ""
+    ).strip()
+
+    tipo = str(
+        tipo or ""
+    ).strip().lower()
+
+    if not phone_number_id:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle=(
+                "Falta phone_number_id."
+            ),
+        )
+
+    if not wa_id:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle="Falta wa_id.",
+        )
+
+    if not tipo:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle=(
+                "Falta el tipo de mensaje."
+            ),
+        )
+
+    if not isinstance(
+        contenido,
+        dict,
+    ):
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle=(
+                "El contenido del mensaje "
+                "no es válido."
+            ),
+        )
+
+    try:
+
+        url = _build_url(
+            f"{phone_number_id}/messages"
+        )
+
+    except (
+        MetaClientNoConfigurado,
+        ValueError,
+    ) as exc:
+
+        return _respuesta_error(
+            tipo="configuration_error",
+            detalle=str(exc),
+        )
 
     payload = {
         "messaging_product":
@@ -172,180 +525,215 @@ def enviar_mensaje_texto_meta(
             wa_id,
 
         "type":
-            "text",
+            tipo,
 
-        "text": {
-            "preview_url": False,
-            "body": text,
-        },
+        tipo:
+            contenido,
     }
 
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=(
-                3.0,
-                5.0,
+    resultado = _post_json(
+        url=url,
+        payload=payload,
+        access_token=access_token,
+        timeout=(
+            3.0,
+            10.0,
+        ),
+    )
+
+    if resultado.get(
+        "success"
+    ) is not True:
+
+        return resultado
+
+    data = resultado.get(
+        "raw_response"
+    )
+
+    wamid = _obtener_wamid(
+        data
+    )
+
+    if not wamid:
+
+        return _respuesta_error(
+            tipo="missing_wamid",
+            detalle=(
+                "Meta aceptó el mensaje pero "
+                "no devolvió wamid."
+            ),
+            raw_response=data,
+        )
+
+    return {
+        "success": True,
+        "wamid": wamid,
+        "raw_response": data,
+    }
+
+
+# ==========================================================
+# TEXTO
+# ==========================================================
+
+
+def enviar_mensaje_texto_meta(
+    phone_number_id: str,
+    wa_id: str,
+    text: str,
+    access_token: Optional[str] = None,
+) -> dict:
+    """
+    Envía un mensaje de texto.
+
+    El destinatario proviene de la identidad WhatsApp
+    almacenada por MAO Comunicaciones.
+    """
+
+    text = str(
+        text or ""
+    ).strip()
+
+    if not text:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle=(
+                "No se puede enviar "
+                "un mensaje vacío."
             ),
         )
 
-        response.raise_for_status()
-
-        data = response.json()
-
-        wamid = _obtener_wamid(
-            data
-        )
-
-        return {
-            "success": True,
-            "wamid": wamid,
-            "raw_response": data,
-        }
-
-    except requests.exceptions.HTTPError as http_err:
-
-        details = (
-            http_err.response.text
-            if http_err.response is not None
-            else str(http_err)
-        )
-
-        logger.error(
-            "Error HTTP enviando mensaje a Meta "
-            "(%s -> %s): %s",
-            phone_number_id,
-            wa_id,
-            details,
-        )
-
-        return {
-            "error": "HTTP Error",
-            "details": details,
-        }
-
-    except requests.exceptions.RequestException as req_err:
-
-        logger.error(
-            "Error de red/Timeout enviando mensaje "
-            "a Meta: %s",
-            req_err,
-        )
-
-        return {
-            "error": "Network Error",
-            "details": str(req_err),
-        }
-
-    except ValueError as json_err:
-
-        logger.error(
-            "Error decodificando respuesta JSON "
-            "de Meta: %s",
-            json_err,
-        )
-
-        return {
-            "error": "JSON Parse Error",
-            "details": str(json_err),
-        }
+    return enviar_payload_mensaje_meta(
+        phone_number_id=phone_number_id,
+        wa_id=wa_id,
+        tipo="text",
+        contenido={
+            "preview_url": False,
+            "body": text,
+        },
+        access_token=access_token,
+    )
 
 
 # ==========================================================
-# SUBIR ARCHIVO / MEDIA A META
+# SUBIR MULTIMEDIA
 # ==========================================================
+
 
 def subir_media_meta(
     phone_number_id: str,
     archivo_bytes: bytes,
     nombre_archivo: str,
     mime_type: str,
-    access_token: str = None,
+    access_token: Optional[str] = None,
 ) -> dict:
     """
-    Sube un archivo a WhatsApp Cloud API.
+    Sube multimedia a WhatsApp Cloud API.
 
-    Devuelve el media_id generado por Meta.
+    Esta función es genérica y puede utilizarse para:
 
-    Este método puede utilizarse posteriormente para:
-    - PDF
-    - imágenes
-    - audio
-    - otros tipos admitidos por WhatsApp.
-
-    Para nuestra ficha técnica:
-
-        mime_type = application/pdf
+        PDF
+        imágenes
+        audio
+        video
+        documentos
     """
 
-    token = (
-        access_token
-        or get_global_access_token()
-    )
+    phone_number_id = str(
+        phone_number_id or ""
+    ).strip()
 
-    # ======================================================
-    # VALIDACIONES
-    # ======================================================
+    nombre_archivo = str(
+        nombre_archivo or ""
+    ).strip()
 
-    if not token:
-        logger.error(
-            "No se ha configurado META_ACCESS_TOKEN "
-            "para subir multimedia."
-        )
-
-        return {
-            "error": "Missing access token",
-        }
+    mime_type = str(
+        mime_type or ""
+    ).strip()
 
     if not phone_number_id:
-        return {
-            "error": "Missing phone_number_id",
-        }
 
-    if not archivo_bytes:
-        return {
-            "error": "Missing file content",
-        }
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle=(
+                "Falta phone_number_id."
+            ),
+        )
 
-    if not nombre_archivo:
-        return {
-            "error": "Missing filename",
-        }
+    if not isinstance(
+        archivo_bytes,
+        (
+            bytes,
+            bytearray,
+        ),
+    ):
 
-    if not mime_type:
-        return {
-            "error": "Missing mime type",
-        }
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle=(
+                "El contenido del archivo "
+                "no es binario."
+            ),
+        )
 
-    # ======================================================
-    # URL
-    # ======================================================
-
-    url = _build_url(
-        f"{phone_number_id}/media"
+    archivo_bytes = bytes(
+        archivo_bytes
     )
 
-    # ======================================================
-    # HEADERS
-    # ======================================================
-    #
-    # IMPORTANTE:
-    #
-    # No ponemos Content-Type manualmente porque requests
-    # construye automáticamente multipart/form-data y su
-    # boundary.
-    # ======================================================
+    if not archivo_bytes:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle=(
+                "El archivo está vacío."
+            ),
+        )
+
+    if not nombre_archivo:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle=(
+                "Falta nombre_archivo."
+            ),
+        )
+
+    if not mime_type:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle="Falta mime_type.",
+        )
+
+    try:
+
+        token = _resolver_token(
+            access_token
+        )
+
+        url = _build_url(
+            f"{phone_number_id}/media"
+        )
+
+    except (
+        MetaClientNoConfigurado,
+        ValueError,
+    ) as exc:
+
+        return _respuesta_error(
+            tipo="configuration_error",
+            detalle=str(exc),
+        )
 
     headers = {
         "Authorization":
             f"Bearer {token}",
-    }
 
-    # ======================================================
-    # FORM DATA
-    # ======================================================
+        "Accept":
+            "application/json",
+    }
 
     data = {
         "messaging_product":
@@ -360,11 +748,8 @@ def subir_media_meta(
         ),
     }
 
-    # ======================================================
-    # REQUEST
-    # ======================================================
-
     try:
+
         response = requests.post(
             url,
             headers=headers,
@@ -376,106 +761,108 @@ def subir_media_meta(
             ),
         )
 
-        response.raise_for_status()
+    except requests.Timeout:
 
-        response_data = (
-            response.json()
+        logger.warning(
+            "Timeout subiendo multimedia a Meta."
         )
 
-        media_id = response_data.get(
+        return _respuesta_error(
+            tipo="timeout",
+            detalle=(
+                "Meta tardó demasiado en "
+                "recibir el archivo."
+            ),
+        )
+
+    except requests.RequestException:
+
+        logger.exception(
+            "Error de red subiendo multimedia a Meta."
+        )
+
+        return _respuesta_error(
+            tipo="network_error",
+            detalle=(
+                "No fue posible subir "
+                "el archivo a Meta."
+            ),
+        )
+
+    if not response.ok:
+
+        (
+            codigo,
+            detalle,
+            raw,
+        ) = _extraer_error_meta(
+            response
+        )
+
+        return _respuesta_error(
+            tipo="http_error",
+            detalle=detalle,
+            status_code=response.status_code,
+            codigo=codigo,
+            raw_response=raw,
+        )
+
+    try:
+        response_data = response.json()
+
+    except ValueError:
+
+        return _respuesta_error(
+            tipo="invalid_json",
+            detalle=(
+                "Meta devolvió una respuesta "
+                "inválida al subir multimedia."
+            ),
+            status_code=response.status_code,
+        )
+
+    media_id = str(
+        response_data.get(
             "id"
         )
+        or ""
+    ).strip()
 
-        if not media_id:
+    if not media_id:
 
-            logger.error(
-                "Meta respondió correctamente al subir "
-                "el archivo, pero no devolvió media_id."
-            )
-
-            return {
-                "error": "Missing media_id",
-                "raw_response": response_data,
-            }
-
-        logger.info(
-            "Archivo subido correctamente a Meta. "
-            "phone_number_id=%s media_id=%s "
-            "filename=%s",
-            phone_number_id,
-            media_id,
-            nombre_archivo,
+        return _respuesta_error(
+            tipo="missing_media_id",
+            detalle=(
+                "Meta recibió el archivo pero "
+                "no devolvió media_id."
+            ),
+            raw_response=response_data,
         )
 
-        return {
-            "success": True,
-            "media_id": media_id,
-            "raw_response": response_data,
-        }
+    logger.info(
+        "Multimedia subida correctamente a Meta."
+    )
 
-    except requests.exceptions.HTTPError as http_err:
-
-        details = (
-            http_err.response.text
-            if http_err.response is not None
-            else str(http_err)
-        )
-
-        logger.error(
-            "Error HTTP subiendo archivo a Meta "
-            "(phone_number_id=%s, filename=%s): %s",
-            phone_number_id,
-            nombre_archivo,
-            details,
-        )
-
-        return {
-            "error": "HTTP Error",
-            "details": details,
-        }
-
-    except requests.exceptions.RequestException as req_err:
-
-        logger.error(
-            "Error de red/Timeout subiendo archivo "
-            "a Meta: %s",
-            req_err,
-        )
-
-        return {
-            "error": "Network Error",
-            "details": str(req_err),
-        }
-
-    except ValueError as json_err:
-
-        logger.error(
-            "Error decodificando respuesta JSON "
-            "al subir archivo a Meta: %s",
-            json_err,
-        )
-
-        return {
-            "error": "JSON Parse Error",
-            "details": str(json_err),
-        }
+    return {
+        "success": True,
+        "media_id": media_id,
+        "raw_response": response_data,
+    }
 
 
 # ==========================================================
-# SUBIR PDF
+# DOCUMENTO PDF
 # ==========================================================
+
 
 def subir_documento_pdf_meta(
     phone_number_id: str,
     pdf_bytes: bytes,
     nombre_archivo: str,
-    access_token: str = None,
+    access_token: Optional[str] = None,
 ) -> dict:
     """
-    Atajo específico para subir documentos PDF.
-
-    Se utilizará para la ficha técnica enviada desde
-    el ERP MAO.
+    Atajo para subir un PDF.
     """
 
     return subir_media_meta(
@@ -488,248 +875,254 @@ def subir_documento_pdf_meta(
 
 
 # ==========================================================
-# ENVIAR DOCUMENTO YA SUBIDO
+# ENVIAR DOCUMENTO
 # ==========================================================
+
 
 def enviar_documento_meta(
     phone_number_id: str,
     wa_id: str,
     media_id: str,
     nombre_archivo: str,
-    caption: str = None,
-    access_token: str = None,
+    caption: Optional[str] = None,
+    access_token: Optional[str] = None,
 ) -> dict:
     """
-    Envía por WhatsApp un documento previamente subido
-    a Meta.
-
-    El documento debe estar identificado mediante media_id.
-
-    wa_id:
-        Número del cliente recibido desde el ERP.
-
-    phone_number_id:
-        Número corporativo MAO configurado en Meta.
-
-    media_id:
-        Identificador devuelto por subir_media_meta().
+    Envía un documento previamente subido a Meta.
     """
 
-    token = (
-        access_token
-        or get_global_access_token()
-    )
+    media_id = str(
+        media_id or ""
+    ).strip()
 
-    # ======================================================
-    # VALIDACIONES
-    # ======================================================
+    nombre_archivo = str(
+        nombre_archivo or ""
+    ).strip()
 
-    if not token:
-        logger.error(
-            "No se ha configurado META_ACCESS_TOKEN "
-            "para enviar documentos."
-        )
-
-        return {
-            "error": "Missing access token",
-        }
-
-    if not phone_number_id:
-        return {
-            "error": "Missing phone_number_id",
-        }
-
-    if not wa_id:
-        return {
-            "error": "Missing wa_id",
-        }
+    caption = str(
+        caption or ""
+    ).strip()
 
     if not media_id:
-        return {
-            "error": "Missing media_id",
-        }
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle="Falta media_id.",
+        )
 
     if not nombre_archivo:
-        return {
-            "error": "Missing filename",
-        }
 
-    # ======================================================
-    # URL
-    # ======================================================
-
-    url = _build_url(
-        f"{phone_number_id}/messages"
-    )
-
-    # ======================================================
-    # HEADERS
-    # ======================================================
-
-    headers = {
-        "Authorization":
-            f"Bearer {token}",
-
-        "Content-Type":
-            "application/json",
-    }
-
-    # ======================================================
-    # DOCUMENTO
-    # ======================================================
-
-    documento = {
-        "id":
-            media_id,
-
-        "filename":
-            nombre_archivo,
-    }
-
-    if caption:
-        documento["caption"] = caption
-
-    # ======================================================
-    # PAYLOAD
-    # ======================================================
-
-    payload = {
-        "messaging_product":
-            "whatsapp",
-
-        "recipient_type":
-            "individual",
-
-        "to":
-            wa_id,
-
-        "type":
-            "document",
-
-        "document":
-            documento,
-    }
-
-    # ======================================================
-    # REQUEST
-    # ======================================================
-
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=(
-                3.0,
-                10.0,
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle=(
+                "Falta nombre_archivo."
             ),
         )
 
-        response.raise_for_status()
+    documento = {
+        "id": media_id,
+        "filename": nombre_archivo,
+    }
 
-        data = response.json()
+    if caption:
 
-        wamid = _obtener_wamid(
-            data
+        documento[
+            "caption"
+        ] = caption
+
+    resultado = enviar_payload_mensaje_meta(
+        phone_number_id=phone_number_id,
+        wa_id=wa_id,
+        tipo="document",
+        contenido=documento,
+        access_token=access_token,
+    )
+
+    if resultado.get(
+        "success"
+    ) is True:
+
+        resultado[
+            "media_id"
+        ] = media_id
+
+    return resultado
+
+
+# ==========================================================
+# IMAGEN
+# ==========================================================
+
+
+def enviar_imagen_meta(
+    phone_number_id: str,
+    wa_id: str,
+    media_id: str,
+    caption: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> dict:
+    """
+    Envía una imagen previamente subida.
+    """
+
+    media_id = str(
+        media_id or ""
+    ).strip()
+
+    if not media_id:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle="Falta media_id.",
         )
 
-        logger.info(
-            "Documento enviado a Meta. "
-            "phone_number_id=%s wa_id=%s "
-            "media_id=%s wamid=%s",
-            phone_number_id,
-            wa_id,
-            media_id,
-            wamid,
+    contenido = {
+        "id": media_id,
+    }
+
+    caption = str(
+        caption or ""
+    ).strip()
+
+    if caption:
+        contenido["caption"] = caption
+
+    resultado = enviar_payload_mensaje_meta(
+        phone_number_id=phone_number_id,
+        wa_id=wa_id,
+        tipo="image",
+        contenido=contenido,
+        access_token=access_token,
+    )
+
+    if resultado.get("success") is True:
+        resultado["media_id"] = media_id
+
+    return resultado
+
+
+# ==========================================================
+# VIDEO
+# ==========================================================
+
+
+def enviar_video_meta(
+    phone_number_id: str,
+    wa_id: str,
+    media_id: str,
+    caption: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> dict:
+    """
+    Envía un video previamente subido.
+    """
+
+    media_id = str(
+        media_id or ""
+    ).strip()
+
+    if not media_id:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle="Falta media_id.",
         )
 
-        return {
-            "success": True,
-            "wamid": wamid,
-            "media_id": media_id,
-            "raw_response": data,
-        }
+    contenido = {
+        "id": media_id,
+    }
 
-    except requests.exceptions.HTTPError as http_err:
+    caption = str(
+        caption or ""
+    ).strip()
 
-        details = (
-            http_err.response.text
-            if http_err.response is not None
-            else str(http_err)
+    if caption:
+        contenido["caption"] = caption
+
+    resultado = enviar_payload_mensaje_meta(
+        phone_number_id=phone_number_id,
+        wa_id=wa_id,
+        tipo="video",
+        contenido=contenido,
+        access_token=access_token,
+    )
+
+    if resultado.get("success") is True:
+        resultado["media_id"] = media_id
+
+    return resultado
+
+
+# ==========================================================
+# AUDIO
+# ==========================================================
+
+
+def enviar_audio_meta(
+    phone_number_id: str,
+    wa_id: str,
+    media_id: str,
+    access_token: Optional[str] = None,
+) -> dict:
+    """
+    Envía audio previamente subido.
+    """
+
+    media_id = str(
+        media_id or ""
+    ).strip()
+
+    if not media_id:
+
+        return _respuesta_error(
+            tipo="validation_error",
+            detalle="Falta media_id.",
         )
 
-        logger.error(
-            "Error HTTP enviando documento a Meta "
-            "(%s -> %s): %s",
-            phone_number_id,
-            wa_id,
-            details,
-        )
+    resultado = enviar_payload_mensaje_meta(
+        phone_number_id=phone_number_id,
+        wa_id=wa_id,
+        tipo="audio",
+        contenido={
+            "id": media_id,
+        },
+        access_token=access_token,
+    )
 
-        return {
-            "error": "HTTP Error",
-            "details": details,
-        }
+    if resultado.get("success") is True:
+        resultado["media_id"] = media_id
 
-    except requests.exceptions.RequestException as req_err:
-
-        logger.error(
-            "Error de red/Timeout enviando "
-            "documento a Meta: %s",
-            req_err,
-        )
-
-        return {
-            "error": "Network Error",
-            "details": str(req_err),
-        }
-
-    except ValueError as json_err:
-
-        logger.error(
-            "Error decodificando respuesta JSON "
-            "al enviar documento a Meta: %s",
-            json_err,
-        )
-
-        return {
-            "error": "JSON Parse Error",
-            "details": str(json_err),
-        }
+    return resultado
 
 
 # ==========================================================
 # SUBIR + ENVIAR PDF
 # ==========================================================
 
+
 def enviar_pdf_meta(
     phone_number_id: str,
     wa_id: str,
     pdf_bytes: bytes,
     nombre_archivo: str,
-    caption: str = None,
-    access_token: str = None,
+    caption: Optional[str] = None,
+    access_token: Optional[str] = None,
 ) -> dict:
     """
-    Flujo completo para enviar un PDF:
+    Flujo técnico completo:
 
         PDF
-         ↓
-        subir a Meta
-         ↓
+          ↓
+        upload Meta
+          ↓
         media_id
-         ↓
-        enviar documento
-         ↓
+          ↓
+        send document
+          ↓
         wamid
 
-    Esta será la función principal que utilizaremos
-    posteriormente desde la integración ERP -> Asistente.
+    No conoce ERP, Citas ni Asistente.
     """
-
-    # ======================================================
-    # 1. SUBIR PDF
-    # ======================================================
 
     resultado_subida = (
         subir_documento_pdf_meta(
@@ -740,22 +1133,30 @@ def enviar_pdf_meta(
         )
     )
 
-    if not resultado_subida.get(
-        "success"
+    if (
+        resultado_subida.get(
+            "success"
+        )
+        is not True
     ):
+
         return {
-            "error": "Media upload failed",
+            "success": False,
+            "error": {
+                "type":
+                    "media_upload_failed",
+
+                "message":
+                    "No fue posible subir "
+                    "el PDF a Meta.",
+            },
             "upload_result":
                 resultado_subida,
         }
 
-    media_id = resultado_subida.get(
+    media_id = resultado_subida[
         "media_id"
-    )
-
-    # ======================================================
-    # 2. ENVIAR DOCUMENTO
-    # ======================================================
+    ]
 
     resultado_envio = (
         enviar_documento_meta(
@@ -768,147 +1169,157 @@ def enviar_pdf_meta(
         )
     )
 
-    if not resultado_envio.get(
-        "success"
+    if (
+        resultado_envio.get(
+            "success"
+        )
+        is not True
     ):
+
         return {
-            "error": "Document send failed",
-            "media_id": media_id,
+            "success": False,
+            "error": {
+                "type":
+                    "document_send_failed",
+
+                "message":
+                    "El PDF fue subido pero "
+                    "no pudo enviarse.",
+            },
+            "media_id":
+                media_id,
             "upload_result":
                 resultado_subida,
             "send_result":
                 resultado_envio,
         }
 
-    # ======================================================
-    # RESULTADO
-    # ======================================================
-
     return {
         "success": True,
-        "media_id":
-            media_id,
-
-        "wamid":
-            resultado_envio.get(
-                "wamid"
-            ),
-
+        "media_id": media_id,
+        "wamid": resultado_envio.get(
+            "wamid"
+        ),
         "upload_result":
             resultado_subida,
-
         "send_result":
             resultado_envio,
     }
 
 
 # ==========================================================
-# OBTENER URL DE DESCARGA DE MULTIMEDIA
+# OBTENER URL DE MULTIMEDIA
 # ==========================================================
+
 
 def obtener_url_descarga_media(
     media_id: str,
-    access_token: str = None,
-) -> str:
+    access_token: Optional[str] = None,
+) -> Optional[str]:
     """
-    Consulta a Meta Graph API por la URL temporal y segura
-    asociada a un media_id.
+    Obtiene la URL temporal de descarga asociada
+    a un media_id de Meta.
     """
 
-    token = (
-        access_token
-        or get_global_access_token()
-    )
-
-    if not token:
-        logger.error(
-            "No se ha configurado un META_ACCESS_TOKEN "
-            "para descargar multimedia."
-        )
-
-        return None
+    media_id = str(
+        media_id or ""
+    ).strip()
 
     if not media_id:
         return None
 
-    url = _build_url(
-        media_id
-    )
+    try:
+
+        token = _resolver_token(
+            access_token
+        )
+
+        url = _build_url(
+            media_id
+        )
+
+    except (
+        MetaClientNoConfigurado,
+        ValueError,
+    ):
+
+        logger.exception(
+            "No fue posible preparar la consulta de media."
+        )
+
+        return None
 
     headers = {
         "Authorization":
             f"Bearer {token}",
+
+        "Accept":
+            "application/json",
     }
 
     try:
+
         response = requests.get(
             url,
             headers=headers,
             timeout=(
                 3.0,
-                5.0,
+                7.0,
             ),
         )
 
-        response.raise_for_status()
+    except requests.RequestException:
 
+        logger.exception(
+            "Error de red obteniendo URL de multimedia."
+        )
+
+        return None
+
+    if not response.ok:
+
+        logger.warning(
+            "Meta rechazó consulta de multimedia HTTP %s.",
+            response.status_code,
+        )
+
+        return None
+
+    try:
         data = response.json()
 
-        return data.get(
-            "url"
-        )
-
-    except requests.exceptions.HTTPError as http_err:
-
-        details = (
-            http_err.response.text
-            if http_err.response is not None
-            else str(http_err)
-        )
+    except ValueError:
 
         logger.error(
-            "Error HTTP obteniendo URL "
-            "de media_id=%s: %s",
-            media_id,
-            details,
+            "Meta devolvió JSON inválido "
+            "consultando multimedia."
         )
 
         return None
 
-    except requests.exceptions.RequestException as req_err:
+    media_url = data.get(
+        "url"
+    )
 
-        logger.error(
-            "Error de red obteniendo URL "
-            "de media_id=%s: %s",
-            media_id,
-            req_err,
-        )
-
+    if not media_url:
         return None
 
-    except ValueError as json_err:
-
-        logger.error(
-            "Error decodificando respuesta JSON "
-            "para media_id=%s: %s",
-            media_id,
-            json_err,
-        )
-
-        return None
+    return str(
+        media_url
+    ).strip()
 
 
 # ==========================================================
-# DESCARGAR ARCHIVO FÍSICO
+# DESCARGAR ARCHIVO
 # ==========================================================
+
 
 def descargar_archivo_fisico(
     media_url: str,
-    access_token: str = None,
-) -> tuple:
+    access_token: Optional[str] = None,
+):
     """
-    Descarga físicamente un archivo desde la URL temporal
-    proporcionada por Meta.
+    Descarga bytes desde una URL temporal de Meta.
 
     Retorna:
 
@@ -916,23 +1327,38 @@ def descargar_archivo_fisico(
             bytes_content,
             mime_type,
         )
+
+    En caso de fallo:
+
+        (None, None)
     """
 
-    token = (
-        access_token
-        or get_global_access_token()
-    )
-
-    if not token:
-        logger.error(
-            "No se ha configurado META_ACCESS_TOKEN "
-            "para descargar el archivo."
-        )
-
-        return None, None
+    media_url = str(
+        media_url or ""
+    ).strip()
 
     if not media_url:
-        return None, None
+        return (
+            None,
+            None,
+        )
+
+    try:
+        token = _resolver_token(
+            access_token
+        )
+
+    except MetaClientNoConfigurado:
+
+        logger.exception(
+            "Meta no está configurado "
+            "para descargar multimedia."
+        )
+
+        return (
+            None,
+            None,
+        )
 
     headers = {
         "Authorization":
@@ -940,53 +1366,48 @@ def descargar_archivo_fisico(
     }
 
     try:
+
         response = requests.get(
             media_url,
             headers=headers,
             timeout=(
                 3.0,
-                10.0,
+                30.0,
             ),
         )
 
-        response.raise_for_status()
+    except requests.RequestException:
 
-        content = response.content
-
-        mime_type = (
-            response.headers.get(
-                "Content-Type",
-                "application/octet-stream",
-            )
+        logger.exception(
+            "Error descargando multimedia desde Meta."
         )
 
         return (
-            content,
-            mime_type,
+            None,
+            None,
         )
 
-    except requests.exceptions.HTTPError as http_err:
+    if not response.ok:
 
-        details = (
-            http_err.response.text
-            if http_err.response is not None
-            else str(http_err)
+        logger.warning(
+            "Meta rechazó descarga multimedia HTTP %s.",
+            response.status_code,
         )
 
-        logger.error(
-            "Error HTTP descargando archivo "
-            "desde Meta: %s",
-            details,
+        return (
+            None,
+            None,
         )
 
-        return None, None
-
-    except requests.exceptions.RequestException as req_err:
-
-        logger.error(
-            "Error de red/Timeout descargando "
-            "archivo desde Meta: %s",
-            req_err,
+    mime_type = (
+        response.headers.get(
+            "Content-Type"
         )
+        or
+        "application/octet-stream"
+    )
 
-        return None, None
+    return (
+        response.content,
+        mime_type,
+    )
